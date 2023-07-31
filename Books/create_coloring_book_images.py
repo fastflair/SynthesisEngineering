@@ -23,7 +23,7 @@ def generate_coloring_page(input: PilImage) -> PilImage:
     return Image.fromarray(np_image)
 
 # specify directories
-input_dir = './images'  # replace with your input directory
+input_dir = './images/upscaled/restored_imgs'  # replace with your input directory
 output_dir = './images/coloring_pages'  # replace with your output directory
 
 # create output directory if it doesn't exist
