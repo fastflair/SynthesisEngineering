@@ -195,9 +195,12 @@ def upscale_batch_and_concatenate(upscale_model, latents, inf_device, output_dev
     return torch.stack(upscaled_latents)
 
 
-def save_video(tensor: Union[List[np.ndarray], List[PIL.Image.Image]], fps: int = 8):
+def save_video(tensor: Union[List[np.ndarray], List[PIL.Image.Image]], fps: int = 8, filename: str = ""):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    video_path = f"./output/{timestamp}.mp4"
+    if filename == "":
+        video_path = f"./output/{timestamp}.mp4"
+    else:
+        video_path = f"{filename}.mp4"
     os.makedirs(os.path.dirname(video_path), exist_ok=True)
     export_to_video(tensor, video_path, fps=fps)
     return video_path
