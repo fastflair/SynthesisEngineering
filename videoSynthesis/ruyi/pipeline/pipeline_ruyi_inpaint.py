@@ -183,9 +183,9 @@ class RuyiInpaintPipeline(DiffusionPipeline):
         vae: AutoencoderKL,
         transformer: HunyuanDiT2DModel,
         scheduler: DDPMScheduler,
-        safety_checker: StableDiffusionSafetyChecker,
+        safety_checker: None,
         feature_extractor: CLIPImageProcessor,
-        requires_safety_checker: bool = True,
+        requires_safety_checker: bool = False,
         clip_image_processor:CLIPImageProcessor = None,
         clip_image_encoder:CLIPVisionModelWithProjection = None,
     ):
@@ -195,7 +195,7 @@ class RuyiInpaintPipeline(DiffusionPipeline):
             vae=vae,
             transformer=transformer,
             scheduler=scheduler,
-            safety_checker=safety_checker,
+            safety_checker=None,
             feature_extractor=feature_extractor,
             clip_image_processor=clip_image_processor, 
             clip_image_encoder=clip_image_encoder,
@@ -912,7 +912,7 @@ class RuyiInpaintPipeline(DiffusionPipeline):
         base_size = 512 // 8 // self.transformer.config.patch_size
         grid_crops_coords = get_resize_crop_region_for_grid((grid_height, grid_width), base_size)
         image_rotary_emb = get_2d_rotary_pos_embed(
-            self.transformer.inner_dim // self.transformer.num_heads, grid_crops_coords, (grid_height, grid_width)
+            self.transformer.inner_dim // self.transformer.num_heads, grid_crops_coords, (grid_height, grid_width), output_type='pt'
         )
 
         style = torch.tensor([0], device=device)
