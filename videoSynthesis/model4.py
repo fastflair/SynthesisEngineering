@@ -19,7 +19,6 @@ from transformers.modeling_utils import PreTrainedModel
 
 from typing import Optional, Union, Dict, List, Any
 
-
 @contextmanager
 def switch_weight_name():
     transformers.modeling_utils.WEIGHTS_NAME = diffusers.utils.constants.WEIGHTS_NAME
@@ -31,7 +30,6 @@ def switch_weight_name():
     transformers.modeling_utils.WEIGHTS_INDEX_NAME = transformers.utils.WEIGHTS_INDEX_NAME
     transformers.modeling_utils.SAFE_WEIGHTS_NAME = transformers.utils.SAFE_WEIGHTS_NAME
     transformers.modeling_utils.SAFE_WEIGHTS_INDEX_NAME = transformers.utils.SAFE_WEIGHTS_INDEX_NAME
-
 
 def patch_transformers_quantizer_bnb_4bit():
     from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer, Conv1D, get_module_from_name
@@ -45,18 +43,13 @@ def patch_transformers_quantizer_bnb_4bit():
         state_dict: Dict[str, Any],
         unexpected_keys: Optional[List[str]] = None,
     ):
-        """
-        combines logic from _load_state_dict_into_meta_model and .integrations.bitsandbytes.py::set_module_quantized_tensor_to_device()
-        """
         import bitsandbytes as bnb
 
         module, tensor_name = get_module_from_name(model, param_name)
-
         if tensor_name not in module._parameters:
             raise ValueError(f"{module} does not have a parameter or a buffer named {tensor_name}.")
 
         old_value = getattr(module, tensor_name)
-
         if tensor_name == "bias":
             if param_value is None:
                 new_value = old_value.to(target_device)
@@ -76,11 +69,7 @@ def patch_transformers_quantizer_bnb_4bit():
         ):
             raise ValueError(f"{tensor_name} is on the meta device, we need a `value` to put in on {target_device}.")
 
-        # construct `new_value` for the module._parameters[tensor_name]:
         if self.pre_quantized:
-            # 4bit loading. Collecting components for restoring quantized weight
-            # This can be expanded to make a universal call for any quantized weight loading
-
             if not self.is_serializable:
                 raise ValueError(
                     "Detected int4 weights but the version of bitsandbytes is not compatible with int4 serialization. "
@@ -109,9 +98,6 @@ def patch_transformers_quantizer_bnb_4bit():
             )
         else:
             new_value = param_value.to("cpu")
-
-            # Support models using `Conv1D` in place of `nn.Linear` (e.g. openai-community/gpt2) by transposing the weight matrix prior to quantization.
-            # Since weights are saved in the correct "orientation", we skip transposing when loading.
             if issubclass(module.source_cls, Conv1D):
                 new_value = new_value.T
 
@@ -121,7 +107,6 @@ def patch_transformers_quantizer_bnb_4bit():
         module._parameters[tensor_name] = new_value
 
     Bnb4BitHfQuantizer.create_quantized_param = create_quantized_param
-
 
 class T5EncoderModel(OriginalT5EncoderModel):
     _torch_dtype = torch.float32
@@ -210,19 +195,18 @@ class T5EncoderModel(OriginalT5EncoderModel):
                     dtype = torch_dtype
                 param = torch.empty_like(param, dtype=dtype, device="cuda")
                 setattr(module, param_name, nn.Parameter(param))
-        # model.quantization_method = "hqq" # not to set it, then we can use `.to(device)` in cpu_offload
         for name, module in modules.items():
             if isinstance(module, nn.Linear):
                 parent_name, linear_name = ".".join(name.split(".")[:-1]), name.split(".")[-1]
                 hqq_layer = HQQLinear(
-                    None, #torch.nn.Linear or None 
-                    quant_config=quant_config, #quantization configuration
-                    compute_dtype=hqq_4bit_compute_dtype, #compute dtype
-                    device="cuda", #cuda device
-                    initialize=True, #Use False to quantize later
-                    del_orig=True, #if True, delete the original layer
+                    None,
+                    quant_config=quant_config,
+                    compute_dtype=hqq_4bit_compute_dtype,
+                    device="cuda",
+                    initialize=True,
+                    del_orig=True,
                 )
-                hqq_layer.weight = torch.empty(1,1,dtype=torch_dtype,device='cuda') # Placeholder
+                hqq_layer.weight = torch.empty(1,1,dtype=torch_dtype,device='cuda')
                 del module.weight
                 del module.bias
 
@@ -269,7 +253,6 @@ class T5EncoderModel(OriginalT5EncoderModel):
 
         return model
 
-
 class FluxConfig(PretrainedConfig):
     def __init__(
         self, 
@@ -295,9 +278,7 @@ class FluxConfig(PretrainedConfig):
         self.pooled_projection_dim = pooled_projection_dim
         self.guidance_embeds = guidance_embeds
         self.axes_dims_rope = axes_dims_rope
-
         super().__init__(**kwargs)
-
 
 class FluxTransformer2DPretrainedModel(PreTrainedModel):
     config_class = FluxConfig
@@ -305,7 +286,6 @@ class FluxTransformer2DPretrainedModel(PreTrainedModel):
 
     def __init__(self, config: FluxConfig):
         super().__init__(config)
-
         patch_size = config.patch_size
         in_channels = config.in_channels
         num_layers = config.num_layers
@@ -329,6 +309,27 @@ class FluxTransformer2DPretrainedModel(PreTrainedModel):
             axes_dims_rope = axes_dims_rope,
         )
 
+    def get_parameter_or_buffer(self, name: str):
+        # Try to fetch from self or self.model
+        try:
+            return dict(self.named_parameters())[name]
+        except KeyError:
+            pass
+        try:
+            return dict(self.named_buffers())[name]
+        except KeyError:
+            pass
+        if hasattr(self, "model"):
+            model = getattr(self, "model")
+            try:
+                return dict(model.named_parameters())[name]
+            except KeyError:
+                pass
+            try:
+                return dict(model.named_buffers())[name]
+            except KeyError:
+                pass
+        raise AttributeError(f"Parameter or buffer '{name}' not found in {type(self).__name__}")
 
 class FluxTransformer2DModel(OriginalFluxTransformer2DModel):
     _cached_wrappers: List[FluxTransformer2DPretrainedModel] = []
@@ -360,5 +361,15 @@ class FluxTransformer2DModel(OriginalFluxTransformer2DModel):
         super().save_pretrained(save_directory, **kwargs)
         self._internal_dict = original_config
 
+    def get_parameter_or_buffer(self, name: str):
+        try:
+            return dict(self.named_parameters())[name]
+        except KeyError:
+            pass
+        try:
+            return dict(self.named_buffers())[name]
+        except KeyError:
+            pass
+        raise AttributeError(f"Parameter or buffer '{name}' not found in {type(self).__name__}")
 
 patch_transformers_quantizer_bnb_4bit()
