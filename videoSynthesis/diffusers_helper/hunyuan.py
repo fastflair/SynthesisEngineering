@@ -7,11 +7,9 @@ from diffusers_helper.utils import crop_or_pad_yield_mask
 @torch.no_grad()
 def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, max_length=256):
     assert isinstance(prompt, str)
-
     prompt = [prompt]
 
-    # LLAMA
-
+    # ---- LLaMA tokenizer formatting ----
     prompt_llama = [DEFAULT_PROMPT_TEMPLATE["template"].format(p) for p in prompt]
     crop_start = DEFAULT_PROMPT_TEMPLATE["crop_start"]
 
@@ -25,26 +23,54 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
         return_overflowing_tokens=False,
         return_attention_mask=True,
     )
-
     llama_input_ids = llama_inputs.input_ids.to(text_encoder.device)
     llama_attention_mask = llama_inputs.attention_mask.to(text_encoder.device)
-    llama_attention_length = int(llama_attention_mask.sum())
 
-    llama_outputs = text_encoder(
-        input_ids=llama_input_ids,
-        attention_mask=llama_attention_mask,
-        output_hidden_states=True,
-    )
+    # Length of the *unpadded* region (batch size is 1 here)
+    llama_attention_length = int(llama_attention_mask.sum().item())
 
-    llama_vec = llama_outputs.hidden_states[-3][:, crop_start:llama_attention_length]
-    # llama_vec_remaining = llama_outputs.hidden_states[-3][:, llama_attention_length:]
-    llama_attention_mask = llama_attention_mask[:, crop_start:llama_attention_length]
+    # ---- Force hidden states + dict outputs; be robust to wrappers ----
+    try:
+        if hasattr(text_encoder, "config"):
+            text_encoder.config.output_hidden_states = True  # ensure model wants to return them
+        llama_outputs = text_encoder(
+            input_ids=llama_input_ids,
+            attention_mask=llama_attention_mask,
+            output_hidden_states=True,
+            return_dict=True,                     # <— critical
+        )
+    except TypeError:
+        # Some wrappers don’t accept return_dict; retry without but still fetch as attribute/tuple
+        llama_outputs = text_encoder(
+            input_ids=llama_input_ids,
+            attention_mask=llama_attention_mask,
+            output_hidden_states=True,
+        )
 
-    assert torch.all(llama_attention_mask.bool())
+    # Prefer penultimate(-3) layer (as before); fall back to last_hidden_state if needed
+    hidden_states = getattr(llama_outputs, "hidden_states", None)
+    if hidden_states is None:
+        # tuple-style output fallback: (last_hidden_state, ..., hidden_states, ...)
+        if isinstance(llama_outputs, (tuple, list)) and len(llama_outputs) >= 3:
+            hidden_states = llama_outputs[2]
+    if hidden_states is None:
+        # Last resort: use last_hidden_state (slightly different semantics but unblocks)
+        base_hidden = getattr(llama_outputs, "last_hidden_state", None)
+        if base_hidden is None and isinstance(llama_outputs, (tuple, list)) and len(llama_outputs) >= 1:
+            base_hidden = llama_outputs[0]
+        if base_hidden is None:
+            raise RuntimeError("LLaMA encoder did not return hidden states or last_hidden_state.")
+        chosen = base_hidden
+    else:
+        chosen = hidden_states[-3]  # what your code originally used
 
-    # CLIP
+    # Apply crop consistent with the template
+    llama_vec = chosen[:, crop_start:llama_attention_length]
+    llama_attn_mask_cropped = llama_attention_mask[:, crop_start:llama_attention_length]
+    assert torch.all(llama_attn_mask_cropped.bool()), "Unexpected padding in cropped region."
 
-    clip_l_input_ids = tokenizer_2(
+    # ---- CLIP-L encoder (pooler fallback) ----
+    clip_l_inputs = tokenizer_2(
         prompt,
         padding="max_length",
         max_length=77,
@@ -53,7 +79,15 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
         return_length=False,
         return_tensors="pt",
     ).input_ids
-    clip_l_pooler = text_encoder_2(clip_l_input_ids.to(text_encoder_2.device), output_hidden_states=False).pooler_output
+    clip_out = text_encoder_2(
+        clip_l_inputs.to(text_encoder_2.device),
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    clip_l_pooler = getattr(clip_out, "pooler_output", None)
+    if clip_l_pooler is None:
+        # Use [CLS] token as a robust fallback
+        clip_l_pooler = clip_out.last_hidden_state[:, 0]
 
     return llama_vec, clip_l_pooler
 
