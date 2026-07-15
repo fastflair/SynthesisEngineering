@@ -6285,7 +6285,9 @@ class BaseVideo:
         after the lead/tail silence was enlarged by dialogue_scene_entry_pad_ms
         and the audio was re-synthesized but the Shot object was not refreshed).
         Going through _target_seconds ensures the frame count always matches
-        the audio floor guarantee: video is never shorter than the WAV.
+        what the engine will actually be driven by: for audio-driven engines,
+        the exact audio duration; for the rest, a floor that guarantees video
+        is never shorter than the WAV.
         """
         secs = self._target_seconds(shot)
         # Apply the same cap that animate() applies for non-audio-driven engines
@@ -6300,27 +6302,46 @@ class BaseVideo:
         return self.vcfg.seed if self.vcfg.seed >= 0 else (abs(hash((self.name, shot.index))) % (2**31))
 
     def _target_seconds(self, shot: Shot) -> float:
+        has_audio = bool(shot.audio_path and Path(shot.audio_path).exists())
+        audio_dur = 0.0
+        if has_audio:
+            # Re-reading the WAV here is the single source of truth: we always
+            # honour the actual file length, not the stale shot.duration field
+            # (the WAV can grow after Shot.duration was last set — e.g. lead/
+            # tail silence enlarged by dialogue_scene_entry_pad_ms and the
+            # audio re-synthesized without clearing the resume cache).
+            audio_dur = _wav_duration(shot.audio_path)
+            if audio_dur > 0 and audio_dur > shot.duration + 0.01:
+                shot.duration = audio_dur
+
+        # Audio-driven engines (Wan-S2V, LTX-2's a2vid path) generate motion
+        # AND lip-sync directly from the waveform — the render length must
+        # come EXACTLY from that audio's duration. No flooring against an
+        # unrelated planning-time duration_hint/default, and no
+        # min_audio_padding safety buffer: that buffer exists so a clip is
+        # never shorter than its (separately-muxed) audio on NON-audio-driven
+        # engines, but here it would just ask the model to render seconds the
+        # audio doesn't cover — extra length that then has to be silently
+        # trimmed back off at the per-shot mux step, which is exactly the
+        # kind of post-hoc audio/video reconciliation this is meant to avoid.
+        # frames_for()/_aligned_frames_for() turn this exact duration into
+        # the engine's frame count (duration*fps, snapped to that engine's
+        # k*align+1 constraint) — the audio itself is not touched again after
+        # this point; it is muxed into the final clip byte-for-byte.
+        if self.supports_audio_drive and has_audio and audio_dur > 0:
+            return audio_dur
+
         secs = (shot.duration_hint if shot.duration_hint
                 else (shot.duration if shot.duration > 0 else self.vcfg.default_seconds))
         secs = float(secs)
-        # Whenever the shot carries ANY audio (dialogue OR narration), the clip
-        # must be at least that long — plus a small buffer for a cut/transition
-        # — regardless of which engine renders it. shot.duration is normally
-        # already the audio length (set in synthesize_audio), but the WAV may
-        # be longer than shot.duration if the lead/tail silence padding was
-        # enlarged (e.g. by dialogue_scene_entry_pad_ms) after a partial render
-        # and the audio was re-synthesized without clearing the resume cache.
-        # Re-reading the WAV here is the single source of truth: we always
-        # honour the actual file length, not the stale shot.duration field.
-        if shot.audio_path and Path(shot.audio_path).exists():
-            audio_dur = _wav_duration(shot.audio_path)
-            if audio_dur > 0:
-                if audio_dur > shot.duration + 0.01:
-                    # WAV grew since the Shot was last updated — sync the field
-                    # so downstream consumers (plan serialization, resume cache
-                    # validation) see the correct length.
-                    shot.duration = audio_dur
-                secs = max(secs, audio_dur + self.vcfg.min_audio_padding)
+        # Non-audio-driven engines render silent video and audio as
+        # independent tracks that only meet at the mux step, so the clip must
+        # be AT LEAST the audio's length (plus a small buffer) or that mux
+        # would truncate the dialogue. This floor is skipped above because
+        # audio-driven engines don't need it: their output is already exactly
+        # as long as the audio that drove it.
+        if has_audio and audio_dur > 0:
+            secs = max(secs, audio_dur + self.vcfg.min_audio_padding)
         return secs
 
     # Per-engine knob: the comfortable length of a single generation. Long takes
@@ -6365,10 +6386,12 @@ class BaseVideo:
         final concat's length trim is what reconciles the whole take against
         the true target.
         """
-        # Audio-driven (lip-sync) takes cover the FULL spoken line (uncapped).
-        # For non-audio-driven engines, max_seconds is a soft cap — but only
-        # for shots with NO audio at all; _target_seconds() already guarantees
-        # a floor of audio_len+padding for any shot that carries audio, and
+        # Audio-driven (lip-sync) takes cover the FULL spoken line (uncapped),
+        # and _target_seconds() returns that audio's EXACT duration for them —
+        # no floor, no buffer, nothing to undercut. For non-audio-driven
+        # engines, max_seconds is a soft cap — but only for shots with NO
+        # audio at all; _target_seconds() guarantees a floor of
+        # audio_len+padding for any shot of theirs that carries audio, and
         # capping here must never undercut that floor (that would silently
         # truncate dialogue/narration when -shortest later muxes the two).
         target = self._target_seconds(shot)
@@ -9556,14 +9579,44 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
             video_only,
         ])
 
-        # --- Step 2: audio hard-cut concat (no overlap, no timing change) -----
-        # The total audio duration is the sum of all merged clip durations with
-        # NO subtraction — audio is never shortened by the transition.
-        audio_total = sum(merged_durs)
+        # --- Step 2: audio hard-cut concat, trimmed AT each boundary ---------
+        # xfade removes d seconds from the VIDEO timeline at every transition
+        # (the outgoing clip's tail and the incoming clip's head are blended
+        # into a single d-second window instead of playing sequentially). The
+        # audio must lose the same d seconds AT THE SAME POINT, or every shot
+        # after the first transition ends up d seconds "behind" where its
+        # video actually is — and that offset keeps accumulating at each
+        # further boundary, which is exactly the drift-that-gets-worse-through
+        # -the-film symptom this was producing.
+        #
+        # Cutting the aggregate sum(chain_D) off the very end (the old
+        # approach) only fixes the TOTAL duration; it does nothing for the
+        # mid-film misalignment, since every scene before the last transition
+        # still plays its full, uncut audio against a video that already
+        # skipped ahead.
+        #
+        # Fix: trim d off the TAIL of each OUTGOING clip's audio, right at its
+        # own boundary. This is always safe — the TTS stage bakes
+        # scene_transition_pad_ms/dialogue_scene_entry_pad_ms (>=700ms) of
+        # silence into that exact tail specifically so a hard cut there is
+        # inaudible, and the dissolve length d (<= scene_transition_seconds,
+        # clamped further by scene_transition_max_ratio) is always well under
+        # that padding.
         audio_only = str(scene_dir / "audio_concat.wav")
         n = len(merged_paths)
-        fc_a_parts = [f"[{i}:a]" for i in range(n)]
-        fc_a = "".join(fc_a_parts) + f"concat=n={n}:v=0:a=1[aout]"
+        fc_a_parts: List[str] = []
+        for i in range(n):
+            d = chain_D[i] if i < len(chain_D) else 0.0
+            if d > 0:
+                trimmed = max(0.0, merged_durs[i] - d)
+                fc_a_parts.append(f"[{i}:a]atrim=0:{trimmed:.3f},asetpts=N/SR/TB[a{i}]")
+            else:
+                fc_a_parts.append(f"[{i}:a]asetpts=N/SR/TB[a{i}]")
+        fc_a = ";".join(fc_a_parts) + ";" + "".join(f"[a{i}]" for i in range(n)) + \
+            f"concat=n={n}:v=0:a=1[aout]"
+        # audio_total now equals video_total exactly (same d's removed from the
+        # same spots), so this is the true, boundary-accurate duration.
+        audio_total = sum(merged_durs) - sum(chain_D)
         _run_ffmpeg([
             *inputs,
             "-filter_complex", fc_a,
@@ -9574,10 +9627,9 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
         ])
 
         # --- Step 3: mux video (with transitions) + audio (hard-cut, exact) --
-        # The video is shorter than the audio by sum(chain_D) because xfade
-        # removes d seconds of video at each boundary. Pad the video's last
-        # frame to match the audio so _mux_audio doesn't truncate either stream.
-        # Then trim both to the video length so no silent tail leaks out.
+        # audio_total == video_total already (both had sum(chain_D) removed at
+        # the same boundaries), so this is now just an exact-length mux, not a
+        # corrective trim.
         _mux_audio(video_only, audio_only, out_path, fps,
                    target_dur=video_total)
 
