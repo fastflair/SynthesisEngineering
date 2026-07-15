@@ -234,6 +234,11 @@ openai_model_large = 'gpt-5.4-mini'
 openai_model_small_reasoning = 'gpt-5.4-nano'
 grok_fast_reasoning_model = 'grok-4.3'
 grok_fast_nonreasoning_model = 'grok-4.3'
+# Vision-capable model for image-in, text-out calls (panel consistency checks,
+# etc.). Both providers' flagship chat models here are multimodal, so this
+# simply reuses the "large" tier rather than naming a separate model.
+openai_vision_model = openai_model_large
+grok_vision_model = grok_fast_nonreasoning_model
 retry_limit = 5
 
 # --- Prompt-size ceiling ---------------------------------------------------
@@ -423,7 +428,7 @@ class Character:
                  creative_medium="", intelligence_markers=None,
                  gender="", physical_build="",
                  cadence="", vocabulary_level="", verbal_tics=None,
-                 catchphrases=None, voice_profile=""):
+                 catchphrases=None, voice_profile="", origin=""):
         # Scalar string fields — coerce None to "" and dicts/lists to str
         self.name = self._coerce_to_str(name, default="Unknown")
         self.age = age  # leave as-is; could be int or "Unknown"
@@ -451,6 +456,14 @@ class Character:
         self.sensory_orientation = self._coerce_to_str(sensory_orientation)
         self.voice_guide = self._coerce_to_str(voice_guide)
         self.dialect = self._coerce_to_str(dialect)
+        # origin — place/culture this character is from (e.g. "Guadalajara,
+        # Mexico"; "rural Appalachia, USA"; "Mumbai, India"). This is the seed
+        # fact that everything culturally-flavoured about the voice hangs off:
+        # dialect, code-switching, cultural/religious references. Captured
+        # here (rather than inferred later from a maybe-silent backstory) so
+        # the voice-profile enrichment pass in comic_book_dialogue.py has
+        # real grounding instead of guessing.
+        self.origin = self._coerce_to_str(origin)
         self.mythic_archetype = self._coerce_to_str(mythic_archetype)
         self.wit_level = self._coerce_to_str(wit_level)
         self.creative_medium = self._coerce_to_str(creative_medium)
@@ -536,6 +549,8 @@ class Character:
             parts.append(f"Thinking: {self.cognitive_style}.")
         if self.humor_style:
             parts.append(f"Humor: {self.humor_style}.")
+        if self.origin:
+            parts.append(f"From: {self.origin}.")
         if self.dialect:
             parts.append(f"Dialect/region: {self.dialect}.")
         if self.cadence:
@@ -1688,6 +1703,57 @@ def get_openai_prompt_response(prompt, max_completion_tokens=150000,
     return ""
 
 
+def get_vision_prompt_response(prompt: str, image_data_url: str,
+                               max_completion_tokens: int = 1000,
+                               temperature: float = 0.0,
+                               use_grok: Optional[bool] = None) -> str:
+    """Image-in, text-out completion. For panel-consistency / QA checks only.
+
+    Sends ONE image alongside a text prompt to a vision-capable chat model and
+    returns the raw text reply (expected to be short JSON for the callers that
+    use this today). Mirrors get_openai_prompt_response's client selection and
+    retry/error handling, but intentionally has NO token-budget guard on the
+    prompt (these calls are short, fixed-shape QA prompts, not free-form
+    generation) and a much lower default max_completion_tokens.
+
+    Built to be handed to comic_book_visual_consistency.check_variant_against_ledger
+    (and similar) as its injected ``vision_fn``:
+        vision_fn = lambda prompt, url: get_vision_prompt_response(prompt, url)
+
+    Returns "" on any failure (network, auth, malformed response) so callers
+    that already treat an empty/unparseable reply as "unchecked" degrade
+    exactly the way they do when no vision_fn is supplied at all.
+    """
+    if use_grok is None:
+        use_grok = USE_GROK
+    try:
+        model = grok_vision_model if use_grok else openai_vision_model
+        client = _get_client(use_grok)
+        token_key = 'max_tokens' if use_grok else 'max_completion_tokens'
+        response = client.chat.completions.create(
+            **{token_key: max_completion_tokens},
+            **_grok_extra_kwargs(use_grok),
+            messages=[
+                {"role": "system", "content": (
+                    "You are a precise visual QA assistant. You look at exactly "
+                    "one image and answer strictly in the JSON format requested. "
+                    "No commentary outside the JSON."
+                )},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ]},
+            ],
+            model=model, temperature=temperature,
+        )
+        _record_cache_usage(response)
+        content = response.choices[0].message.content
+        return content or ""
+    except Exception as e:
+        print(f"Vision QA call failed ({'Grok' if use_grok else 'OpenAI'}): {e}")
+        return ""
+
+
 def get_openai_prompt_response_reasoning(prompt, max_completion_tokens=150000,
                                          openai_model=None, use_grok=None):
     """Reasoning-mode completion (no temperature, longer thinking)."""
@@ -1977,16 +2043,33 @@ def generate_characters(character_tiers, max_retries=3):
                     f"- relationship_style, romantic_energy\n"
                     f"- creative_expression, sensory_orientation\n"
                     f"- speech_pattern (with example line)\n"
+                    f"- origin: SPECIFIC place and cultural background this character is\n"
+                    f"  from (city + country/region, e.g. 'Guadalajara, Mexico', 'rural\n"
+                    f"  Appalachia, USA', 'Mumbai, India', 'Lagos, Nigeria'), or the\n"
+                    f"  regional US background if no immigration is implied (e.g. 'small-\n"
+                    f"  town Georgia', 'working-class Boston'). Ground this in the story's\n"
+                    f"  setting and the role — where the cast naturally supports it, aim\n"
+                    f"  for a believable RANGE of backgrounds rather than an all-neutral\n"
+                    f"  cast; never force a background where the story gives no basis for\n"
+                    f"  one, and never make a character's origin their only trait.\n"
                     f"\n"
                     f"VOICE PROFILE (critical - this is how the character SOUNDS on the\n"
                     f"page; make every character audibly distinct so a reader could\n"
                     f"identify the speaker with the name removed):\n"
-                    f"- dialect: regional/cultural origin of their speech rendered as it\n"
-                    f"  would look ON THE PAGE - specific word choices, contractions,\n"
-                    f"  grammar, idioms of that region/class/era. Be concrete\n"
-                    f"  (e.g. 'rural Appalachian: drops g's, reckon, a-fixin to,\n"
-                    f"  double modals like might could'), NOT vague ('Southern accent').\n"
-                    f"  If standard/neutral, say so.\n"
+                    f"- dialect: how THIS origin actually colours their speech on the\n"
+                    f"  page - specific word choices, contractions, grammar, idioms, and\n"
+                    f"  (where the character is bilingual/immigrant/first-generation)\n"
+                    f"  natural CODE-SWITCHING into short phrases of their first language.\n"
+                    f"  Be concrete, e.g.:\n"
+                    f"    'rural Appalachian English: drops g's, reckon, a-fixin to,\n"
+                    f"     double modals like might could'\n"
+                    f"    'Mexican-American Spanglish: swaps in short Spanish phrases and\n"
+                    f"     exclamations naturally mid-sentence (¡Ay, no manches!, órale,\n"
+                    f"     mijo/mija), code-switches when emotional'\n"
+                    f"    'Indian English: sing-song rhythm, \"only\"/\"na\" sentence-enders,\n"
+                    f"     present-continuous where American English wouldn't, occasional\n"
+                    f"     Hindi endearments or invocations (beta, arre, \"Hey Bhagwan\")'\n"
+                    f"  If standard/neutral, say so plainly rather than inventing a flavor.\n"
                     f"- cadence: the MUSIC of their speech. The most vivid voices\n"
                     f"  alternate between short, punchy statements and longer, winding\n"
                     f"  clauses - describe THIS character's particular rhythm (clipped\n"
@@ -2005,6 +2088,10 @@ def generate_characters(character_tiers, max_retries=3):
                     f"  about the world? Dry irony, absurdist, self-deprecating, biting?\n"
                     f"- voice_profile: ONE flowing paragraph (40-70 words) synthesising\n"
                     f"  the above into a portrait of how this person talks.\n\n"
+                    f"AUTHENTICITY RULE: render culture/dialect through real, specific word\n"
+                    f"choice and idiom, with dignity - never a mocking phonetic caricature\n"
+                    f"or a checklist of stereotypes. A few true, well-observed details beat\n"
+                    f"a costume of clichés.\n\n"
                     f"Return JSON array of {len(role_batch)} character objects. No markdown.\n"
                     f"All voice fields are REQUIRED for human characters."
                 )
@@ -2022,14 +2109,20 @@ def generate_characters(character_tiers, max_retries=3):
                     f"- backstory (1-2 sentences)\n"
                     f"- personality_type, humor_style, knowledge_domains (array 1-2)\n"
                     f"- signature_habits (array 1-2), speech_pattern\n"
+                    f"- origin: place/culture this character is from (city + country/\n"
+                    f"  region, or a US regional background), grounded in the story's\n"
+                    f"  setting — or 'unspecified' if it wouldn't matter for this role.\n"
                     f"VOICE (make this character audibly distinct):\n"
-                    f"- dialect: concrete regional/class speech rendered as on-page word\n"
-                    f"  choices and grammar, or 'standard/neutral'.\n"
+                    f"- dialect: concrete regional/cultural speech flowing from their\n"
+                    f"  origin, rendered as on-page word choices and grammar — including\n"
+                    f"  light code-switching into a first language where that fits (e.g.\n"
+                    f"  a Spanish phrase, a Hindi endearment) — or 'standard/neutral'.\n"
                     f"- cadence: their speech rhythm (e.g. alternates short punchy lines\n"
                     f"  with long winding clauses; clipped; lyrical; breathless).\n"
                     f"- vocabulary_level: slang / plain / erudite - the exact right words,\n"
                     f"  no fluff.\n"
                     f"- verbal_tics (array 0-2): speech fingerprints.\n\n"
+                    f"Render culture with authenticity and dignity, never caricature.\n"
                     f"Return JSON array of {len(role_batch)} character objects. No markdown."
                 )
             else:
@@ -2106,6 +2199,7 @@ def generate_characters(character_tiers, max_retries=3):
                             verbal_tics=char.get('verbal_tics', []),
                             catchphrases=char.get('catchphrases', []),
                             voice_profile=char.get('voice_profile', ''),
+                            origin=char.get('origin', ''),
                         )
                         for char in valid_chars
                     ]

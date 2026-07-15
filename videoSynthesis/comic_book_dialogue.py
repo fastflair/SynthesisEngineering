@@ -110,6 +110,21 @@ class CharacterVoiceProfile:
     catchphrases: List[str] = field(default_factory=list)
     humor_style: str = ''
     speech_signature: str = ''    # a synthesised paragraph for the LLM
+    # code_switch_language: the OTHER language this character sometimes lapses
+    # into (e.g. "Spanish", "Hindi/Punjabi"), or '' if they're a monolingual/
+    # standard English speaker. Distinct from dialect_markers (which are
+    # English-grammar patterns) — this drives actual short foreign-language
+    # phrases/exclamations dropped naturally into otherwise-English lines
+    # (Spanglish-style code-switching), not just accented English.
+    code_switch_language: str = ''
+    # cultural_references: recurring CONTENT allusions rooted in the
+    # character's culture/faith/upbringing — as opposed to signature_lexicon,
+    # which is about WORDS. e.g. invoking a deity or saint when startled,
+    # a grandmother's saying, a food/family reference used as a metaphor.
+    # This is what makes an Indian character's "Hey Bhagwan!" or a devout
+    # Southern character's "Lord willing" land as lived-in rather than a
+    # single decorative word.
+    cultural_references: List[str] = field(default_factory=list)
 
     def guide_block(self) -> str:
         """Compact multi-line block describing this voice for the reviewer LLM."""
@@ -130,6 +145,15 @@ class CharacterVoiceProfile:
         if self.signature_lexicon:
             out.append(f"    signature words/exclamations (sprinkle, don't overuse): "
                        f"{', '.join(self.signature_lexicon[:8])}")
+        if self.code_switch_language:
+            out.append(f"    code-switches into: {self.code_switch_language} — drop in a "
+                       f"short authentic phrase/exclamation when emotional or intimate, "
+                       f"then let context (not a clunky translation) carry the meaning; "
+                       f"1 in a handful of lines is plenty, never every line")
+        if self.cultural_references:
+            out.append(f"    cultural/personal touchstones (use sparingly, as this "
+                       f"person's real reflexes — not decoration): "
+                       f"{'; '.join(self.cultural_references[:5])}")
         if self.verbal_tics:
             out.append(f"    verbal tics: {', '.join(self.verbal_tics[:4])}")
         if self.catchphrases:
@@ -147,6 +171,7 @@ def _seed_profile(c) -> CharacterVoiceProfile:
     p = CharacterVoiceProfile(
         name=name,
         gender=str(_get(c, 'gender', '')),
+        origin=str(_get(c, 'origin', '')),
         accent=str(_get(c, 'dialect', '')),          # Character.dialect often holds accent
         register=str(_get(c, 'vocabulary_level', '')),
         cadence=str(_get(c, 'cadence', '')),
@@ -205,9 +230,12 @@ def _enrich_batch(batch: list, profiles: Dict[str, CharacterVoiceProfile],
         traits_s = ', '.join(traits[:6]) if isinstance(traits, list) else str(traits)
         age = str(_get(c, 'age', ''))
         existing_dialect = str(_get(c, 'dialect', ''))
+        existing_origin = str(_get(c, 'origin', ''))
         char_blocks.append(
             f'- name: {nm}\n'
             f'  role: {role}\n  age: {age}\n  traits: {traits_s}\n'
+            f'  origin (already established — treat as ground truth, do not '
+            f'contradict): {existing_origin or "(not established)"}\n'
             f'  existing dialect note: {existing_dialect or "(none)"}\n'
             f'  backstory: {backstory}'
         )
@@ -226,7 +254,9 @@ CHARACTERS:
 {chars_text}
 
 For EACH character return:
-  - origin: place/culture they're from (city + country/region), or "" if unclear
+  - origin: place/culture they're from (city + country/region). If an origin
+    is already established above, return it unchanged; otherwise infer from
+    backstory/traits, or "" if genuinely unclear.
   - accent: how their origin colours their English (e.g. "French-accented English,
     soft 'h's, melodic"; "Jamaican Patois inflection"; "flat Midwestern American"),
     or "" if a neutral standard speaker
@@ -240,6 +270,22 @@ For EACH character return:
     genuinely use (slang, oaths, loanwords, fillers) — real, specific, not
     stereotype confetti. e.g. ["oy", "bubbeleh", "feh"] or ["putain", "alors",
     "non?"] or ["wah gwaan", "irie", "bredren"]
+  - code_switch_language: if this character is bilingual, an immigrant, or
+    first-generation, the OTHER language they'd naturally lapse into under
+    emotion or intimacy (e.g. "Spanish", "Hindi", "Yoruba"), or "" if they are
+    monolingual/standard English. This is separate from accent — it means they
+    sometimes speak an actual SHORT phrase or exclamation in that language,
+    Spanglish-style, not just accented English.
+  - cultural_references: 2-5 recurring CONTENT touchstones this person's mind
+    actually goes to — not more vocabulary, but what they invoke: a deity or
+    saint when startled or grateful, a grandparent's saying, a food or family
+    ritual used as a metaphor, a proverb from their tradition. Real and
+    specific to THIS character's background, e.g. ["invokes Ganesha before
+    anything risky", "measures trouble in 'how many rotis deep' it is"] or
+    ["crosses herself and says a quick Hail Mary", "compares everything to her
+    abuela's cooking"] or ["swears on his granddaddy's shotgun", "quotes
+    scripture when he's cornered"]. Empty list if this character wouldn't
+    have any (plenty of people don't, and that's fine).
   - register: casual | formal | vulgar | refined | streetwise | clinical | folksy | …
   - speech_signature: ONE vivid sentence summarising how they sound.
 
@@ -247,12 +293,16 @@ RULES:
 - Authenticity over stereotype. A few true markers beat a costume of clichés.
 - Keep accent renderable through WORD CHOICE and light markers; the reader must
   still read it easily.
-- If a character is plainly a neutral-standard speaker, say so (empty accent).
+- If a character is plainly a neutral-standard speaker, say so (empty accent,
+  empty code_switch_language, empty cultural_references) — not every character
+  needs cultural flavor, and forcing it onto every character is itself a
+  stereotype.
 
 Return ONLY a JSON array:
 [{{"name":"...","origin":"...","accent":"...","heritage":"...",
-   "dialect_markers":["..."],"signature_lexicon":["..."],"register":"...",
-   "speech_signature":"..."}}]
+   "dialect_markers":["..."],"signature_lexicon":["..."],
+   "code_switch_language":"...","cultural_references":["..."],
+   "register":"...","speech_signature":"..."}}]
 """
     raw = _llm(prompt, temperature=0.5)
     parsed = _parse(raw)
@@ -271,12 +321,17 @@ Return ONLY a JSON array:
         if item.get('register'): prof.register = str(item['register']).strip()
         if item.get('speech_signature'):
             prof.speech_signature = str(item['speech_signature']).strip()
+        if item.get('code_switch_language'):
+            prof.code_switch_language = str(item['code_switch_language']).strip()
         dm = item.get('dialect_markers')
         if isinstance(dm, list):
             prof.dialect_markers = [str(x).strip() for x in dm if str(x).strip()][:5]
         lex = item.get('signature_lexicon')
         if isinstance(lex, list):
             prof.signature_lexicon = [str(x).strip() for x in lex if str(x).strip()][:8]
+        cr = item.get('cultural_references')
+        if isinstance(cr, list):
+            prof.cultural_references = [str(x).strip() for x in cr if str(x).strip()][:5]
 
 
 def _match_profile(name: str, profiles: Dict[str, CharacterVoiceProfile]
@@ -517,7 +572,22 @@ CULTURAL_AUTHENTICITY_GUARDRAIL = (
     "they define the voice (a drunk's slur, a strong regional lilt, a heritage "
     "loanword) — enough to HEAR it, never so heavy it's hard to read and never a "
     "mocking phonetic caricature or a pile of stereotypes. A real person uses "
-    "their own words naturally; write them with that dignity."
+    "their own words naturally; write them with that dignity.\n"
+    "CODE-SWITCHING — if a voice profile lists a code-switch language, that "
+    "character may drop a short, real phrase or exclamation in that language "
+    "into an otherwise-English line, the way real bilingual speakers do "
+    "(Spanglish, Hinglish, etc.) — most naturally under stress, emotion, or "
+    "intimacy. Let the surrounding English context carry the meaning instead "
+    "of bolting on a parenthetical translation; e.g. '¡Ay, cuidado! Watch the "
+    "step—' reads fine without glossing 'cuidado'. Use it as a flavor, not a "
+    "crutch: most of a character's lines still read as plain English with the "
+    "occasional switch, not every line stuffed with foreign words.\n"
+    "CULTURAL REFERENCES — a voice profile's cultural_references are what this "
+    "person's mind actually reaches for (a deity invoked when startled, a "
+    "grandparent's saying, a food/family metaphor). Land ONE, occasionally, "
+    "when the moment genuinely calls for it — this is a real reflex, not a "
+    "tag to stamp on every panel. A character with none listed should get none "
+    "invented; plenty of real people don't reach for these, and that's fine."
 )
 
 
@@ -553,6 +623,46 @@ def _ensure_excl(text: str) -> str:
     return t
 
 
+def enforce_narrator_captions(script: List[Dict]) -> int:
+    """Deterministically force every NARRATOR line's bubble to 'caption'.
+
+    The dialogue-generation and dialogue-review LLM calls are told to use
+    ``speaker: "NARRATOR", bubble_type: "caption"`` for narration, but that's a
+    convention living in a prompt, not a guarantee — in practice the LLM
+    regularly leaves ``bubble_type`` as the default ``"speech"`` (or omits it)
+    on a NARRATOR line, which renders narration in a character speech bubble
+    instead of the yellow caption box. Rather than re-prompting/retrying the
+    LLM, this is a plain, reliable Python rule: if ``speaker`` is NARRATOR
+    (case-insensitive), the bubble is a caption — full stop. No LLM call is
+    needed for this because it isn't a creative judgment call.
+
+    Only touches lines whose speaker is NARRATOR; every other line (actual
+    character speech, including its emotional bubble shape) is left entirely
+    to the LLM / ``apply_dialogue_delivery`` and is untouched here.
+
+    Returns the number of lines corrected.
+    """
+    changed = 0
+    for page in script:
+        if not isinstance(page, dict) or page.get('_act_break'):
+            continue
+        for panel in (page.get('panels') or []):
+            for line in (panel.get('dialogue') or []):
+                if not isinstance(line, dict):
+                    continue
+                speaker = str(line.get('speaker', '')).strip()
+                if speaker.upper() != 'NARRATOR':
+                    continue
+                if str(line.get('bubble_type', '')).strip().lower() != 'caption':
+                    line['bubble_type'] = 'caption'
+                    changed += 1
+    if changed:
+        logger.info(
+            f"[Delivery] Forced {changed} NARRATOR line(s) to caption bubbles "
+            f"(LLM had left them as speech/other).")
+    return changed
+
+
 def apply_dialogue_delivery(script: List[Dict],
                             profiles: Optional[Dict[str, CharacterVoiceProfile]] = None
                             ) -> int:
@@ -565,13 +675,18 @@ def apply_dialogue_delivery(script: List[Dict],
       • makes a shout LOOK like a shout (UPPER-CASE, '!'); a delight end on '!';
       • records the resolved delivery on the line ('delivery') for transparency.
 
+    NARRATOR lines are handled separately and unconditionally by
+    ``enforce_narrator_captions`` (called first, below) — narration is never a
+    "character voice" delivery choice, so it's forced to 'caption' by plain
+    Python rather than left to the LLM.
+
     Text rewriting for accent/slur/seduction is the LLM reviewer's job (guided
     by voice_profile_guide / delivery_guidance_block); this pass only enforces
     the small, safe, reliable things the LLM is inconsistent about.
 
     Returns the number of lines adjusted.
     """
-    changed = 0
+    changed = enforce_narrator_captions(script)
     for page in script:
         if not isinstance(page, dict) or page.get('_act_break'):
             continue

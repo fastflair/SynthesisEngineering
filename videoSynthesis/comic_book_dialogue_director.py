@@ -98,6 +98,14 @@ TIC_MIN_COUNT: int = int(os.getenv("EDITOR_TIC_MIN_COUNT", "5"))
 PHRASE_MIN_COUNT: int = int(os.getenv("EDITOR_PHRASE_MIN_COUNT", "3"))
 # Narrator caption opener (first 2-3 words) used at least this many times is a crutch.
 OPENER_MIN_COUNT: int = int(os.getenv("EDITOR_OPENER_MIN_COUNT", "3"))
+# Signature-usage check (catchphrases / signature_lexicon from the voice profile):
+# minimum lines a character needs before we judge over/under-use — too few lines
+# and one occurrence swings the share wildly, so stay quiet until there's a
+# real sample.
+SIGNATURE_MIN_LINES: int = int(os.getenv("EDITOR_SIGNATURE_MIN_LINES", "6"))
+# Share of a character's lines containing ANY registered signature marker above
+# which it reads as a crutch/caricature rather than a spice.
+SIGNATURE_OVERUSE_SHARE: float = float(os.getenv("EDITOR_SIGNATURE_OVERUSE_SHARE", "0.4"))
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +190,52 @@ def _ngrams(words: List[str], n: int) -> List[str]:
     return [" ".join(words[i:i + n]) for i in range(len(words) - n + 1)]
 
 
+def _prof_get(profile: Any, attr: str) -> list:
+    """Read a list-valued attribute off a CharacterVoiceProfile OR a dict."""
+    if profile is None:
+        return []
+    v = getattr(profile, attr, None)
+    if v is None and isinstance(profile, dict):
+        v = profile.get(attr)
+    return list(v) if isinstance(v, (list, tuple)) else []
+
+
+def _registered_terms(profile: Any) -> Tuple[set, set]:
+    """(single_word_terms, multi_word_phrases) normalised, for a voice profile.
+
+    Pulls from catchphrases + signature_lexicon — the two voice-profile fields
+    that are literal words/phrases a character actually says, as opposed to
+    cultural_references (behavioural guidance, not matchable text) or accent/
+    dialect_markers (prose descriptions of a pattern, not a literal string).
+    """
+    words: set = set()
+    phrases: set = set()
+    for item in _prof_get(profile, 'catchphrases') + _prof_get(profile, 'signature_lexicon'):
+        n = _norm(str(item))
+        if not n:
+            continue
+        toks = n.split()
+        if len(toks) == 1:
+            words.add(toks[0])
+        else:
+            phrases.add(n)
+    return words, phrases
+
+
+def _registered_tic_exclusions(profile: Any) -> set:
+    """All individual words that belong to a registered term (word OR phrase).
+
+    Used to keep the generic word-tic detector from ALSO flagging "ay", "dios",
+    "mio" as separate overused words when "ay dios mio" is already covered,
+    more precisely, by the dedicated signature-usage note.
+    """
+    words, phrases = _registered_terms(profile)
+    out = set(words)
+    for p in phrases:
+        out.update(p.split())
+    return out
+
+
 @dataclass
 class VoiceFingerprint:
     line_count: int = 0
@@ -190,14 +244,23 @@ class VoiceFingerprint:
     opener_freq: Counter = field(default_factory=Counter)
     per_act_words: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
     per_act_lines: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    # Signature-usage tracking (populated only when voice_profiles is passed to
+    # analyze_book): how many of this character's lines used ANY of their own
+    # registered catchphrases/signature_lexicon, and which specific ones.
+    signature_hits: int = 0
+    signature_phrase_counts: Counter = field(default_factory=Counter)
 
     @property
     def avg_words(self) -> float:
         return (self.total_words / self.line_count) if self.line_count else 0.0
 
-    def tics(self) -> List[Tuple[str, int]]:
+    def tics(self, exclude: Optional[set] = None) -> List[Tuple[str, int]]:
         out = []
         for w, c in self.word_freq.most_common(40):
+            if exclude and w in exclude:
+                continue   # this word is a REGISTERED signature term — the
+                           # dedicated signature_note() covers it instead, so
+                           # it isn't double-flagged as a generic "tic"
             if c >= TIC_MIN_COUNT or (self.line_count and c / self.line_count >= TIC_SHARE):
                 out.append((w, c))
         return out[:8]
@@ -216,6 +279,37 @@ class VoiceFingerprint:
         if overlap < 0.12:
             return (f"voice may have drifted between act {acts[0]} and act "
                     f"{acts[-1]} (little shared vocabulary) — keep them the same person")
+        return ""
+
+    def signature_note(self, profile: Any) -> str:
+        """Guidance on this character's use of their OWN voice-profile markers.
+
+        Two failure modes, both worth catching:
+          - OVERUSE: a catchphrase/signature word shows up in so many lines it
+            reads as a crutch or caricature rather than a spice.
+          - NEVER USED: the profile defines real signature markers but NONE of
+            them ever appeared — the distinct voice this character was given
+            never actually made it onto the page.
+        Silent (returns "") when there's nothing registered, too few lines to
+        judge, or usage is in the healthy middle.
+        """
+        words, phrases = _registered_terms(profile)
+        if not words and not phrases:
+            return ""
+        if self.line_count < SIGNATURE_MIN_LINES:
+            return ""
+        share = self.signature_hits / self.line_count if self.line_count else 0.0
+        if self.signature_hits == 0:
+            sample = sorted(words | phrases)[:3]
+            return (f"has a defined voice signature ({', '.join(sample)}) that "
+                    f"never appeared across {self.line_count} lines — let it "
+                    f"actually show up")
+        if share > SIGNATURE_OVERUSE_SHARE:
+            top = self.signature_phrase_counts.most_common(1)
+            top_note = f', especially "{top[0][0]}" (\u00d7{top[0][1]})' if top else ''
+            return (f"leans on their signature markers in {self.signature_hits}/"
+                    f"{self.line_count} lines ({share:.0%}){top_note} — let more "
+                    f"lines breathe without one, it's losing its spark")
         return ""
 
 
@@ -283,11 +377,28 @@ def _ordered_panels(page: Dict) -> List[Dict]:
     return panels
 
 
-def analyze_book(script: List[Dict]) -> BookDialogueAnalysis:
-    """Cheap, deterministic whole-book read. Zero LLM tokens."""
+def analyze_book(script: List[Dict],
+                 voice_profiles: Optional[Dict] = None) -> BookDialogueAnalysis:
+    """Cheap, deterministic whole-book read. Zero LLM tokens.
+
+    ``voice_profiles``, when supplied, lets this also track whether each
+    character actually uses their OWN declared catchphrases/signature_lexicon
+    at a healthy rate (see VoiceFingerprint.signature_note) — and keeps those
+    registered phrases out of the generic book-wide "overused phrase" crutch
+    counter below, since a catchphrase recurring is by design, not a bug.
+    """
     a = BookDialogueAnalysis()
     if not isinstance(script, list):
         return a
+
+    voice_profiles = voice_profiles or {}
+    # Registered multi-word phrases across the WHOLE cast, so the generic
+    # book-wide phrase-crutch counter doesn't fight the catchphrase system by
+    # telling the reviewer to "retire" a line that's supposed to recur.
+    all_registered_phrases: set = set()
+    for _prof in voice_profiles.values():
+        _, _phrases = _registered_terms(_prof)
+        all_registered_phrases |= _phrases
 
     phrase_counts: Counter = Counter()
     # for long-range dup detection
@@ -309,9 +420,10 @@ def analyze_book(script: List[Dict]) -> BookDialogueAnalysis:
                 narr = _is_narr(line)
                 content = _content(text)
                 words = _tokens(text)
+                speaker_name = str(line.get("speaker", "")).strip() or "?"
 
                 fp = a.narrator if narr else a.fingerprints.setdefault(
-                    str(line.get("speaker", "")).strip() or "?", VoiceFingerprint())
+                    speaker_name, VoiceFingerprint())
                 fp.line_count += 1
                 fp.total_words += len(words)
                 fp.word_freq.update(content)
@@ -323,9 +435,30 @@ def analyze_book(script: List[Dict]) -> BookDialogueAnalysis:
                 if opener:
                     fp.opener_freq[opener] += 1
 
-                # book-wide phrase crutches (bi/tri-grams of content words)
+                # signature-marker usage: does this line use ANY of THIS
+                # character's own registered catchphrases/signature_lexicon?
+                if not narr and voice_profiles:
+                    prof = voice_profiles.get(speaker_name)
+                    if prof is not None:
+                        sig_words, sig_phrases = _registered_terms(prof)
+                        if sig_words or sig_phrases:
+                            word_set = set(words)
+                            matched = sorted(sig_words & word_set)
+                            norm_line = _norm(text)
+                            matched += [p for p in sig_phrases if p and p in norm_line]
+                            if matched:
+                                fp.signature_hits += 1
+                                for m in matched:
+                                    fp.signature_phrase_counts[m] += 1
+
+                # book-wide phrase crutches (bi/tri-grams of content words) —
+                # skip anything that's a registered signature phrase (or a
+                # sub-slice of one) for ANY character; that's tracked (and
+                # rate-limited) separately above.
                 for n in (3, 2):
                     for g in _ngrams(content, n):
+                        if any(g in rp or rp in g for rp in all_registered_phrases):
+                            continue
                         phrase_counts[g] += 1
 
                 # weak-line flags
@@ -403,21 +536,29 @@ def _book_level_notes(a: BookDialogueAnalysis) -> str:
     return "\n".join(lines)
 
 
-def _window_notes(a: BookDialogueAnalysis, page_nums: set, speakers: set) -> str:
+def _window_notes(a: BookDialogueAnalysis, page_nums: set, speakers: set,
+                  voice_profiles: Optional[Dict] = None) -> str:
     """Notes specific to the pages/speakers in this window."""
+    voice_profiles = voice_profiles or {}
     lines: List[str] = []
-    # per-character tics + drift for this window's speakers
+    # per-character tics + drift + signature-usage for this window's speakers
     for name in sorted(speakers):
         fp = a.fingerprints.get(name)
         if not fp:
             continue
+        profile = voice_profiles.get(name)
+        sig_words = _registered_tic_exclusions(profile) if profile is not None else set()
         parts = []
-        tics = fp.tics()
+        tics = fp.tics(exclude=sig_words)
         if tics:
             parts.append("overuses " + ", ".join(f"{w}(\u00d7{c})" for w, c in tics))
         drift = fp.drift_note()
         if drift:
             parts.append(drift)
+        if profile is not None:
+            sig_note = fp.signature_note(profile)
+            if sig_note:
+                parts.append(sig_note)
         if parts:
             lines.append(f"  {name}: " + "; ".join(parts))
     if lines:
@@ -703,7 +844,7 @@ def polish_book_dialogue(
 
     # A) whole-book deterministic analysis (0 tokens)
     try:
-        analysis = analyze_book(script)
+        analysis = analyze_book(script, voice_profiles)
         result.analysis = analysis.as_dict()
     except Exception as e:
         logger.warning("[Director] analysis failed (%s); skipping re-polish.", e)
@@ -748,7 +889,7 @@ def polish_book_dialogue(
     for wi, (pages, page_nums, speakers, window_txt) in enumerate(windows, 1):
         try:
             voice_guide = _window_voice_guide(voice_profiles, sorted(speakers))
-            win_notes = _window_notes(analysis, page_nums, speakers)
+            win_notes = _window_notes(analysis, page_nums, speakers, voice_profiles)
             prompt = _build_window_prompt(voice_guide, win_notes, window_txt)
             raw = llm_fn(prompt, temperature=0.78, max_completion_tokens=16000,
                          cached_prefix=stable_prefix)
@@ -769,7 +910,8 @@ def polish_book_dialogue(
             script, _ = dedupe_repeated_dialogue(
                 script,
                 story_dna=getattr(project, "story_dna", None) if project else None,
-                working_dir=None)
+                working_dir=None,
+                voice_profiles=voice_profiles)
         except Exception as e:
             logger.warning("[Director] post repetition guard skipped (%s).", e)
 

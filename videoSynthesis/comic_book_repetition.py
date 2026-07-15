@@ -39,6 +39,11 @@ recontextualising echoes, and the plant-and-payoff callbacks written by
     ``_callback``, ``_refrain``, ``intentional_repeat``) is never removed.
   * REFRAIN ALLOWLIST — a book-level signature/refrain declared in story_dna is
     exempt from exact-match removal wherever it recurs.
+  * CATCHPHRASE ALLOWLIST — pass ``voice_profiles`` and each character's own
+    declared catchphrases are exempt too (scoped to that speaker only) — a
+    catchphrase recurring is the whole point of it. Whether a catchphrase is
+    recurring too MUCH across the whole book is a different question, answered
+    by comic_book_dialogue_director's signature-usage check, not this module.
   * ORDERING — run this BEFORE ``weave_dialogue_callbacks`` so deliberately
     planted echoes are added afterwards and never seen by the guard.
 
@@ -245,6 +250,7 @@ def dedupe_repeated_dialogue(
     *,
     story_dna: Optional[Dict] = None,
     working_dir: Optional[str] = None,
+    voice_profiles: Optional[Dict] = None,
     near_window: int = NEAR_WINDOW,
     exact_window: int = EXACT_WINDOW,
     char_window: int = CHAR_WINDOW,
@@ -262,6 +268,12 @@ def dedupe_repeated_dialogue(
     ----------
     story_dna : optional dict; a declared signature/refrain in it is exempted
         from exact-match removal wherever it recurs.
+    voice_profiles : optional {name: CharacterVoiceProfile}; each character's
+        OWN declared catchphrases are exempted from removal (scoped to that
+        speaker only) — a catchphrase recurring is the point of it, not a bug.
+        Overall frequency of a catchphrase across the whole book is instead
+        governed by comic_book_dialogue_director's signature-usage check,
+        which can flag it if it crosses from "a spice" into "a crutch".
     near_window / exact_window / char_window : panel-distance gates (see module
         docstring). Recurrences beyond these are treated as deliberate.
     dedupe_character_lines : also drop a character's *verbatim* immediate
@@ -281,6 +293,7 @@ def dedupe_repeated_dialogue(
 
     try:
         refrains = _collect_refrains(story_dna)
+        catchphrases = _collect_catchphrases(voice_profiles)
 
         # Sliding histories. Narration shares one narrator voice → one history.
         # Character lines are tracked per speaker.
@@ -322,9 +335,15 @@ def dedupe_repeated_dialogue(
                     norm = _normalise(text)
                     toks = _content_tokens(norm)
 
-                    # Intentional echoes and declared refrains: keep, and record
-                    # so a later *accidental* repeat of them is still caught.
-                    protected = _is_intentional(line) or (norm in refrains)
+                    # Intentional echoes, declared refrains, and a speaker's OWN
+                    # catchphrase: keep, and record so a later *accidental*
+                    # repeat of them is still caught.
+                    speaker_key = _speaker_key(line)
+                    protected = (
+                        _is_intentional(line)
+                        or (norm in refrains)
+                        or (norm in catchphrases.get(speaker_key, ()))
+                    )
 
                     if _is_narration(line):
                         dup = None if protected else _find_dup(
@@ -485,10 +504,37 @@ def _collect_refrains(story_dna: Optional[Dict]) -> set:
     return out
 
 
+def _collect_catchphrases(voice_profiles: Optional[Dict]) -> Dict[str, set]:
+    """{normalised speaker key: {normalised catchphrase, ...}} from voice profiles.
+
+    A catchphrase is a character's DELIBERATE recurring signature line — the
+    whole reason it exists is to say the same thing again. Without this, the
+    generic per-character dedupe (CHAR_WINDOW, exact-match) would delete a
+    catchphrase the moment it recurred within a few panels of itself, fighting
+    the voice system rather than serving it. This scopes the exemption to the
+    OWNING speaker only (someone else saying the same words is not exempted).
+    """
+    out: Dict[str, set] = {}
+    if not voice_profiles:
+        return out
+    for name, profile in voice_profiles.items():
+        cps = getattr(profile, 'catchphrases', None)
+        if cps is None and isinstance(profile, dict):
+            cps = profile.get('catchphrases')
+        if not cps:
+            continue
+        norm_set = {_normalise(str(c)) for c in cps if str(c).strip()}
+        norm_set.discard('')
+        if norm_set:
+            out[str(name).strip().lower()] = norm_set
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Non-destructive audit (for validators / manifests)
 # ---------------------------------------------------------------------------
 def find_repetitions(script: List[Dict], *, story_dna: Optional[Dict] = None,
+                     voice_profiles: Optional[Dict] = None,
                      near_window: int = NEAR_WINDOW,
                      exact_window: int = EXACT_WINDOW) -> List[Dict]:
     """Report near-adjacent repeats WITHOUT modifying the script.
@@ -500,6 +546,7 @@ def find_repetitions(script: List[Dict], *, story_dna: Optional[Dict] = None,
     if not isinstance(script, list):
         return findings
     refrains = _collect_refrains(story_dna)
+    catchphrases = _collect_catchphrases(voice_profiles)
     narr_hist: List[_Seen] = []
     char_hist: Dict[str, List[_Seen]] = {}
     pos = 0
@@ -525,6 +572,8 @@ def find_repetitions(script: List[Dict], *, story_dna: Optional[Dict] = None,
                     continue
                 norm = _normalise(text)
                 if norm in refrains:
+                    continue
+                if norm in catchphrases.get(_speaker_key(line), ()):
                     continue
                 toks = _content_tokens(norm)
                 if _is_narration(line):

@@ -94,6 +94,14 @@ class CharacterExpectation:
     conditions: List[str] = field(default_factory=list)   # wet, bloodied, muddy…
     permanent_markings: str = ""          # "jagged scar across left cheek"
     held_items: List[str] = field(default_factory=list)
+    # The character's intended emotional register for this panel (e.g. "grieving",
+    # "elated", "seething") — the same prompt-vs-pixels drift that happens to a
+    # shirt colour also happens to an expression: the prompt can say "grieving"
+    # and the model can render a flat, neutral face. Kept separate from the
+    # hard visual facts above (is_checkable() doesn't require it) because a
+    # vision model's read of "does this face show grief" is fuzzier than "is
+    # this shirt blue" — useful as a soft signal, not a hard gate on its own.
+    expected_emotion: str = ""
 
     def describe(self) -> str:
         """A short natural-language line the vision model can check against."""
@@ -110,6 +118,9 @@ class CharacterExpectation:
             bits.append("holding " + ", ".join(self.held_items))
         if self.screen_side:
             bits.append(f"positioned on the {self.screen_side} of the frame")
+        if self.expected_emotion:
+            bits.append(f"should visibly appear {self.expected_emotion} "
+                        f"(facial expression and body language)")
         return " ".join(bits)
 
     def _subject(self) -> str:
@@ -119,6 +130,9 @@ class CharacterExpectation:
         """True when there is at least one hard, adjudicable visual fact."""
         return bool(self.garment_colours or self.permanent_markings
                     or self.held_items or self.screen_side)
+
+    def has_emotion_check(self) -> bool:
+        return bool(self.expected_emotion)
 
 
 @dataclass
@@ -131,13 +145,13 @@ class PanelConsistencyLedger:
     setting: str = ""
 
     def is_checkable(self) -> bool:
-        return any(c.is_checkable() for c in self.characters)
+        return any(c.is_checkable() or c.has_emotion_check() for c in self.characters)
 
     def as_check_spec(self) -> str:
         """Render the ledger into the numbered spec the vision model scores."""
         lines: List[str] = []
         for i, c in enumerate(self.characters):
-            if c.is_checkable():
+            if c.is_checkable() or c.has_emotion_check():
                 lines.append(f"  C{i} — {c.describe()}.")
         return "\n".join(lines)
 
@@ -152,17 +166,27 @@ def _extract_garment_colours(costume_text: str) -> List[Tuple[str, str]]:
     within a small window (so "blue denim jacket" -> ("jacket","blue") but a
     colour far away in another clause isn't wrongly attached). Falls back to a
     bare colour with an unspecified garment when a colour appears with no noun.
+
+    The window is also clipped to start after the END of the previous garment
+    match (not just a fixed char count back), so a colour bound to an earlier
+    garment ("a red flannel shirt and dark jeans") never bleeds forward onto a
+    later, differently-coloured garment ("jeans" picking up "red") — that false
+    attachment would otherwise show up as a spurious mismatch once this ledger
+    is checked against a correctly-rendered image.
     """
     if not costume_text:
         return []
     text = str(costume_text)
     pairs: List[Tuple[str, str]] = []
+    prev_end = 0
     for gm in _GARMENT_RE.finditer(text):
         garment = gm.group(1).lower()
-        window = text[max(0, gm.start() - 40):gm.start()]
+        window_start = max(0, gm.start() - 40, prev_end)
+        window = text[window_start:gm.start()]
         cols = _COLOUR_RE.findall(window)
         if cols:
             pairs.append((garment, cols[-1].lower()))
+        prev_end = gm.end()
     if not pairs:
         # No garment noun matched a colour; record the first colour generically
         first = _COLOUR_RE.search(text)
@@ -200,6 +224,7 @@ def build_consistency_ledger(
     state: Dict[str, Any] = panel_script.get("_appearance_state") or {}
     frame = characters_in_frame or list(state.keys())
     positions = screen_positions or {}
+    panel_key_emotion = str(panel_script.get("_arc_emotion", "") or "").strip()
 
     for name in frame:
         st = state.get(name, {}) if isinstance(state, dict) else {}
@@ -242,6 +267,18 @@ def build_consistency_ledger(
         if isinstance(held, str):
             held = [held]
         exp.held_items = [str(h) for h in held if str(h).strip()][:3]
+
+        # Emotional register — prefer this character's own tracked "worn"
+        # emotion facet (set by the appearance tracker), falling back to the
+        # panel's overall arc emotion when the character has no specific one.
+        # Neutral/blank registers are skipped: there is nothing distinctive to
+        # verify, and flagging "should appear neutral" invites false positives.
+        _neutral = ('', 'neutral', 'blank', 'expressionless', 'composed',
+                   'calm', 'no particular emotion')
+        char_emotion = str((st or {}).get("emotion", "") or "").strip()
+        chosen_emotion = char_emotion or panel_key_emotion
+        if chosen_emotion.lower() not in _neutral:
+            exp.expected_emotion = chosen_emotion[:60]
 
         ledger.characters.append(exp)
 
@@ -307,10 +344,19 @@ _CHECK_INSTRUCTIONS = (
     "only what is clearly visible; if something is genuinely not visible in the "
     "frame (e.g. a forearm tattoo when the arms are out of shot), treat it as "
     "'not violated', not a mismatch.\n\n"
+    "Most expectations are HARD visual facts (garment colour, screen side, a "
+    "permanent marking, a held item) — judge these strictly. An 'should visibly "
+    "appear <emotion>' expectation is SOFTER: judge it by the face and body "
+    "language read as a whole (a slack, unexpressive face when grief was "
+    "expected; a tense, closed posture when joy was expected), not by whether "
+    "a single textbook cue is present. Only flag an emotion mismatch when the "
+    "expression clearly reads as a DIFFERENT or FLAT/neutral register than "
+    "expected, not for a milder or more restrained take on the right emotion.\n\n"
     "Report concrete mismatches only — a wrong garment colour, a figure on the "
     "wrong side of the frame, a missing or moved permanent marking, a held item "
-    "that is absent. Do NOT nitpick art style, rendering quality, or anything "
-    "not in the expectation list.\n\n"
+    "that is absent, or a clearly wrong/flat emotional expression. Do NOT "
+    "nitpick art style, rendering quality, or anything not in the expectation "
+    "list.\n\n"
     "Return ONLY JSON:\n"
     '{"score": 0.0-1.0, "mismatches": ["expected X, saw Y", ...]}\n'
     "score is the fraction of checkable expectations the image satisfies "
