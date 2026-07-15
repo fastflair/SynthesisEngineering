@@ -410,16 +410,33 @@ class VideoConfig:
     high_vram_threshold_gb: float = 40.0        # below this → aggressive offload
     try_sage_attention: bool = True             # Wan benefits a lot from SageAttention
     use_fp8: bool = True                        # Wan I2V: try fp8 dtype first, fall back to bf16 if unsupported
-    # ── Auto-download & 4090 resolution policy ───────────────────────────────
+    # ── Auto-download & resolution policy ────────────────────────────────────
     auto_download_models: bool = True           # fetch missing model files automatically
     cache_dir: str = "./model_cache"            # where auto-downloaded repos/checkpoints land
-    cap_resolution_for_4090: bool = True         # clamp any new image/video to 720p-equivalent
+    cap_resolution_for_4090: bool = True        # clamp any new image/video to 720p-equivalent
     # (long side <= 1280, short side <= 720) — see _cap_resolution_for_4090.
     # dimensions are divisible by 64, so use the same 64-safe policy for stills
     # before animation starts. Example: project 960x544 → image stills 960x576.
     image_resolution_multiple: int = 64
-    image_resolution_rounding: str = "ceil"     # ceil | floor | nearest
-    image_max_long_side: int = 1024             # 4090-friendly cap for still generation
+    image_resolution_rounding: str = "ceil"    # ceil | floor | nearest
+    image_max_long_side: int = 960             # default cap for still generation (3090)
+    # ── LTX-2 generation resolution ──────────────────────────────────────────
+    # apply_gpu_preset() sets these (and vcfg.width/height) together so that
+    # every part of the pipeline — image generation, LTX2._resolution(), compose,
+    # and log messages — all agree on the same dimensions:
+    #
+    #   RTX 3090  →  960 × 576  (16:9, both exact 64-multiples)
+    #   RTX 4090  → 1280 × 720  (16:9 / 720p, 720 is a 16-multiple)
+    #   RTX 5090  → 1280 × 720  (16:9 / 720p, same target as 4090)
+    #
+    # The defaults below match the 3090 preset and are overwritten when you call
+    # apply_gpu_preset() for a different card.  Override ltx2_max_long/short
+    # here (or pass gen_width/gen_height to apply_gpu_preset) to use a custom
+    # resolution; remember that LTX-2 requires dimensions to be multiples of 16.
+    ltx2_max_long: int = 960                   # generation long-side ceiling for LTX-2
+    ltx2_max_short: int = 576                  # generation short-side ceiling for LTX-2
+    ltx2_use_upsampler: bool = False           # upsampler disabled by default; presets
+    #   set this explicitly. True → output is 2× the generation dims.
     # Wan2.2-S2V's local repo (auto-cloned/downloaded here if missing)
     wan_repo_url: str = "https://github.com/Wan-Video/Wan2.2"
     wan_s2v_hf_repo: str = "Wan-AI/Wan2.2-S2V-14B"
@@ -5798,6 +5815,14 @@ def _safe_image_generation_resolution(width: int, height: int, vcfg: "VideoConfi
     Uses a 64-pixel multiple by default so freshly generated stills are valid
     constraints. This affects newly generated PNGs only; downstream compose can
     still normalize the final film to vcfg.width/vcfg.height if those differ.
+
+    When ``prefer_ltx2`` is active the still is the seed frame for the first
+    LTX-2 generation segment, so it **must** be the same size that
+    ``LTX2._resolution()`` will use.  The GPU presets now set ``vcfg.width``
+    and ``vcfg.height`` to the exact target generation resolution (e.g. 960×576
+    for a 3090, 1280×720 for a 4090), so this branch simply snaps those values
+    to the LTX alignment multiple (min 16) and applies the ltx2_max ceiling —
+    resulting in the exact preset resolution with no further scaling.
     """
     mult = int(getattr(vcfg, "image_resolution_multiple", 64) or 64)
     mode = getattr(vcfg, "image_resolution_rounding", "ceil")
@@ -5810,6 +5835,26 @@ def _safe_image_generation_resolution(width: int, height: int, vcfg: "VideoConfi
         scale = max_long / float(max(w, h))
         w = _round_to_multiple(max(mult, int(w * scale)), mult, "floor")
         h = _round_to_multiple(max(mult, int(h * scale)), mult, "floor")
+
+    # ── LTX-2 seed-frame alignment ────────────────────────────────────────────
+    # When LTX-2 is the active engine (prefer_ltx2=True), the still is the seed
+    # frame for the first video segment and must match exactly what
+    # LTX2._resolution() will produce.  The GPU presets now write the target
+    # generation resolution into vcfg.width/height (e.g. 960×576 for 3090,
+    # 1280×720 for 4090) AND into ltx2_max_long/short, so this path just
+    # re-snaps those values with the same mult=max(16, ltx2_resolution_multiple)
+    # used by LTX2._resolution() and applies the same cap — producing the
+    # identical pixel dimensions with no lossy rescaling.
+    if getattr(vcfg, "prefer_ltx2", False):
+        ltx_mult  = max(16, int(getattr(vcfg, "ltx2_resolution_multiple", 64)))
+        ltx_long  = int(getattr(vcfg, "ltx2_max_long",  960))
+        ltx_short = int(getattr(vcfg, "ltx2_max_short", 576))
+        w = _round_to_multiple(width,  ltx_mult, "nearest")
+        h = _round_to_multiple(height, ltx_mult, "nearest")
+        w, h = _cap_resolution_for_4090(w, h,
+                                        max_long=ltx_long,
+                                        max_short=ltx_short,
+                                        multiple=ltx_mult)
 
     return int(w), int(h)
 
@@ -6069,8 +6114,17 @@ def generate_stills(shots: List[Shot], characters: List["Character"],
     imdir.mkdir(parents=True, exist_ok=True)
     W, H = _safe_image_generation_resolution(vcfg.width, vcfg.height, vcfg)
     if (W, H) != (vcfg.width, vcfg.height):
-        logger.info("[IMAGE] project resolution %sx%s adjusted to 64-safe still size %sx%s.",
-                    vcfg.width, vcfg.height, W, H)
+        if getattr(vcfg, "prefer_ltx2", False):
+            ltx_long  = int(getattr(vcfg, "ltx2_max_long",  768))
+            ltx_short = int(getattr(vcfg, "ltx2_max_short", 448))
+            logger.info(
+                "[IMAGE] project resolution %sx%s adjusted to LTX-2 seed-frame size %sx%s "
+                "(ltx2_max_long=%s ltx2_max_short=%s) — stills now match video generation resolution.",
+                vcfg.width, vcfg.height, W, H, ltx_long, ltx_short,
+            )
+        else:
+            logger.info("[IMAGE] project resolution %sx%s adjusted to 64-safe still size %sx%s.",
+                        vcfg.width, vcfg.height, W, H)
 
     def _render_once(prompt: str, seed: int, path_name: str):
         """Generate a single image with the existing one-shot OOM retry."""
@@ -7732,9 +7786,21 @@ class LTX2Video(BaseVideo):
         pass
 
     def _resolution(self) -> Tuple[int, int]:
-        mult = max(32, int(getattr(self.vcfg, "ltx2_resolution_multiple", 64)))
+        # Minimum alignment is 16 (LTX spatial VAE downsampling factor).
+        # Using max(16, ...) rather than max(32, ...) allows preset resolutions
+        # like 1280×720 (720 is a multiple of 16 but not 32 or 64) to pass
+        # through without being incorrectly snapped down to 1280×704.
+        mult = max(16, int(getattr(self.vcfg, "ltx2_resolution_multiple", 64)))
         w = _round_to_multiple(self.vcfg.width, mult, "nearest")
         h = _round_to_multiple(self.vcfg.height, mult, "nearest")
+        # Apply the LTX-2 generation ceiling. GPU presets (applied via
+        # apply_gpu_preset) set ltx2_max_long/short AND vcfg.width/height to
+        # the exact target resolution, so this cap is a no-op in the normal case
+        # and only activates if someone passes an oversized vcfg manually.
+        max_long  = int(getattr(self.vcfg, "ltx2_max_long",  960))
+        max_short = int(getattr(self.vcfg, "ltx2_max_short", 576))
+        w, h = _cap_resolution_for_4090(w, h, max_long=max_long,
+                                        max_short=max_short, multiple=mult)
         return w, h
 
     def _render_segment(self, image, prompt, shot, seconds, seed, out_path,
@@ -7767,35 +7833,32 @@ class LTX2Video(BaseVideo):
         offload = (getattr(v, "ltx2_offload_mode", "cpu") or "").strip()
         ckpt_is_distilled = self._assets.get("checkpoint_is_distilled", "distilled" in Path(ckpt).name.lower())
         ckpt_is_prequant_fp8 = "fp8" in Path(ckpt).name.lower()
+        # Upsampler is optional — skip it for faster renders on 3090.
+        # ltx2_use_upsampler=True (default): pass the upsampler path to the CLI
+        # so the pipeline runs the 2× spatial upscale pass after generation.
+        # ltx2_use_upsampler=False: omit the flag entirely; output stays at the
+        # generation resolution (faster, uses less VRAM during the upscale pass).
+        use_upsampler = bool(getattr(v, "ltx2_use_upsampler", True)) and bool(upsampler)
         # The prompt IS the shot's motion / action_sequence text.
         prompt = prompt or ""
 
         # ── Build the CLI command ────────────────────────────────────────────
-        # We invoke the official pipeline modules directly (python -m …). Their
-        # own argparse converts --quantization into the correct QuantizationPolicy
-        # for the installed version, so we never touch build_policy()/_read_scales()
-        # (the call that was mmapping the whole 46GB file and failing with ENOMEM).
         py = self._python
         base = [py, "-m", ""]   # module filled below
 
         def add_common(cmd: List[str], ckpt_flag: str):
             cmd += [ckpt_flag, ckpt,
-                    "--spatial-upsampler-path", upsampler,
                     "--gemma-root", gemma,
                     "--seed", str(int(seed)),
                     "--output-path", out_path,
                     "--prompt", prompt,
-                    # --image takes PATH FRAME_IDX STRENGTH [CRF] (not just a path).
-                    # Mirrors the Python API's ImageConditioningInput(path, 0, 1.0, 33):
-                    # condition on the start frame (idx 0) at full strength.
                     "--image", img_path, "0", "1.0", "33",
                     "--height", str(int(h)),
                     "--width", str(int(w)),
                     "--num-frames", str(int(frames)),
                     "--frame-rate", str(fps)]
-            # Quantization: only pass a policy for a bf16 checkpoint. A pre-
-            # quantized fp8 file already carries its scales — passing fp8-cast
-            # double-quantizes; the CLI loads its native scales when we omit it.
+            if use_upsampler:
+                cmd += ["--spatial-upsampler-path", upsampler]
             if quant and quant.lower() != "none" and not ckpt_is_prequant_fp8:
                 cmd += ["--quantization", quant]
             if offload and offload.lower() != "none":
@@ -8117,6 +8180,190 @@ def sanitize_plan_for_no_s2v(plan_path: str, out_path: Optional[str] = None,
     out.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
     logger.info("[PLAN] wrote S2V-free plan → %s (%d shot engine tag(s) changed).", out, changed)
     return str(out)
+
+
+def apply_gpu_preset(
+    video: "VideoConfig",
+    gpu: str,
+    gen_width: int = 0,
+    gen_height: int = 0,
+) -> "VideoConfig":
+    """Apply GPU-specific LTX-2 and rendering settings to an existing VideoConfig.
+
+    Call this after creating your VideoConfig with one of the notebook helpers,
+    passing the GPU tier you are running on.  It sets every performance-sensitive
+    field to the best-known values for that card so you only need to specify
+    ``gpu`` once rather than remembering which quantization / resolution /
+    offload combination works on each architecture.
+
+    Supported GPU tiers
+    -------------------
+    "3090"  RTX 3090 / 3090 Ti  (24 GB, Ampere — no native FP8 tensor cores)
+    "4090"  RTX 4090             (24 GB, Ada Lovelace — native FP8 scaled-mm)
+    "5090"  RTX 5090             (32 GB, Blackwell   — native FP8 + more VRAM)
+
+    Parameters
+    ----------
+    video      : VideoConfig to mutate in-place (and return).
+    gpu        : One of "3090", "4090", "5090" (case-insensitive, strips
+                 whitespace and common prefixes like "RTX ", "rtx").
+    gen_width  : LTX-2 generation width.  0 → use the preset default for the
+                 chosen GPU tier.  If provided it overrides the preset value,
+                 but ltx2_max_long/short are still derived from it correctly.
+    gen_height : LTX-2 generation height.  0 → use the preset default.
+
+    Returns
+    -------
+    The same VideoConfig object (mutated), so you can chain:
+        video = apply_gpu_preset(my_video_config, "4090")
+
+    Generation resolutions and quantization per architecture
+    ---------------------------------------------------------
+    3090 (Ampere, 24 GB): 960×576 (16:9, both 64-multiples).
+        fp8-cast is the correct quantization — fp8-scaled-mm requires Ada/Hopper/
+        Blackwell and will crash on Ampere.  CPU offload is essential; the bf16
+        checkpoint is 46 GB.  The upsampler is disabled so output stays at 960×576.
+
+    4090 (Ada Lovelace, 24 GB): 1280×720 (16:9 / 720p).
+        fp8-scaled-mm runs natively on Ada tensor cores.  720 is a multiple of 16
+        (the LTX spatial alignment floor) so ltx2_resolution_multiple=16 is set to
+        let it pass through _resolution() unchanged.  CPU offload keeps VRAM below
+        the 24 GB ceiling.  The upsampler is disabled so output stays at 1280×720.
+
+    5090 (Blackwell, 32 GB): 1280×720 (16:9 / 720p).
+        fp8-scaled-mm runs fastest here.  32 GB VRAM comfortably fits the model
+        without any offload.  Same 720p target as the 4090 for a consistent output
+        format; disable the upsampler for fastest renders at that resolution.
+    """
+    # Normalise the gpu string: strip whitespace, common prefixes, and case.
+    gpu_key = gpu.strip().upper().replace("RTX", "").replace("NVIDIA", "").replace(" ", "").replace("_", "")
+
+    # ── Per-GPU preset tables ─────────────────────────────────────────────────
+    # Each entry is a flat dict of VideoConfig field names → values.
+    # Fields not listed here are left unchanged (whatever the helper set).
+    _PRESETS: Dict[str, Dict] = {
+        # ── RTX 3090 (Ampere, 24 GB) ─────────────────────────────────────────
+        # Generation resolution: 960×576 (exact 64-multiples, 16:9).
+        # fp8-cast: weights stored FP8, matmul runs in a mode Ampere supports.
+        # CPU offload is essential: the bf16 checkpoint is 46 GB.
+        # width/height are set here so every downstream path (image generation,
+        # LTX2._resolution, compose, log messages) all agree on the same dims.
+        "3090": dict(
+            width                   = 960,
+            height                  = 576,
+            ltx2_max_long           = 960,
+            ltx2_max_short          = 576,
+            ltx2_use_upsampler      = True,  # 960×576 is the final output resolution
+            ltx2_quantization       = "fp8-cast",
+            ltx2_offload_mode       = "cpu",
+            ltx2_segment_seconds    = 4.0,   # shorter segments → less VRAM per call
+            image_max_long_side     = 960,
+            high_vram_threshold_gb  = 20.0,  # 3090 has 24 GB; stay well under
+            try_sage_attention      = True,
+            use_fp8                 = True,
+            wan_i2v_steps           = 28,    # Wan fallback: fewer steps on tighter VRAM
+            wan_i2v_guidance_scale  = 5.0,
+            fp_steps                = 28,
+            fp_transformer_offload_preserve_gb = 6,
+            fp_use_teacache         = False,
+        ),
+        # ── RTX 4090 (Ada Lovelace, 24 GB) ───────────────────────────────────
+        # Generation resolution: 1280×720 (720p, 16:9).
+        # 720 is a multiple of 16 but not 32 or 64; ltx2_resolution_multiple=16
+        # lets LTX2._resolution() pass it through unchanged.
+        # fp8-scaled-mm: native FP8 tensor cores on Ada — fastest quantization.
+        # width/height are set here so every downstream path (image generation,
+        # LTX2._resolution, compose, log messages) all agree on the same dims.
+        "4090": dict(
+            width                   = 1280,
+            height                  = 720,
+            ltx2_max_long           = 1280,
+            ltx2_max_short          = 720,
+            ltx2_resolution_multiple = 16,   # allows 720 (mult of 16) through unchanged
+            ltx2_use_upsampler      = True,  # 1280×720 is the final output resolution
+            ltx2_quantization       = "fp8-scaled-mm",
+            ltx2_offload_mode       = "cpu",
+            ltx2_segment_seconds    = 6.0,
+            image_max_long_side     = 1280,
+            high_vram_threshold_gb  = 40.0,
+            try_sage_attention      = True,
+            use_fp8                 = True,
+            wan_i2v_steps           = 32,
+            wan_i2v_guidance_scale  = 5.0,
+            fp_steps                = 32,
+            fp_transformer_offload_preserve_gb = 8,
+            fp_use_teacache         = False,
+        ),
+        # ── RTX 5090 (Blackwell, 32 GB) ──────────────────────────────────────
+        # Generation resolution: 1280×720 (720p, 16:9).
+        # 32 GB VRAM comfortably fits the model without offload.
+        # ltx2_resolution_multiple=16 allows 720 (mult of 16) through unchanged.
+        # width/height are set here so every downstream path (image generation,
+        # LTX2._resolution, compose, log messages) all agree on the same dims.
+        "5090": dict(
+            width                   = 1280,
+            height                  = 720,
+            ltx2_max_long           = 1280,
+            ltx2_max_short          = 720,
+            ltx2_resolution_multiple = 16,   # allows 720 (mult of 16) through unchanged
+            ltx2_use_upsampler      = True,  # 1280×720 is the final output resolution
+            ltx2_quantization       = "fp8-scaled-mm",
+            ltx2_offload_mode       = "none",  # 32 GB fits the model without offload
+            ltx2_segment_seconds    = 8.0,     # longer segments, more VRAM to spare
+            image_max_long_side     = 1280,
+            high_vram_threshold_gb  = 60.0,    # treat 5090 as high-VRAM throughout
+            try_sage_attention      = True,
+            use_fp8                 = True,
+            wan_i2v_steps           = 40,
+            wan_i2v_guidance_scale  = 5.0,
+            fp_steps                = 40,
+            fp_transformer_offload_preserve_gb = 12,
+            fp_use_teacache         = True,    # 32 GB headroom makes TeaCache safe
+        ),
+    }
+
+    preset = _PRESETS.get(gpu_key)
+    if preset is None:
+        known = ", ".join(sorted(_PRESETS))
+        raise ValueError(
+            f"Unknown GPU preset {gpu!r}. Known presets: {known}. "
+            "Pass the VRAM size (e.g. '3090', '4090', '5090') or set "
+            "VideoConfig fields manually."
+        )
+
+    # Apply every preset field to the VideoConfig.
+    for field, value in preset.items():
+        setattr(video, field, value)
+
+    # ── Override resolution if caller supplied explicit dimensions ────────────
+    # gen_width / gen_height are the LTX-2 *generation* dimensions (before any
+    # upsampler pass). When provided they take precedence over the preset values.
+    # Derive ltx2_max_long/short using the same orientation-safe max()/min()
+    # logic so landscape and portrait both work correctly.
+    if gen_width > 0 or gen_height > 0:
+        w = gen_width  if gen_width  > 0 else video.width
+        h = gen_height if gen_height > 0 else video.height
+        # Snap to min 16-pixel multiple (LTX alignment floor)
+        mult = max(16, int(getattr(video, "ltx2_resolution_multiple", 16)))
+        w = max(mult, round(w / mult) * mult)
+        h = max(mult, round(h / mult) * mult)
+        video.width          = w
+        video.height         = h
+        video.ltx2_max_long  = max(w, h)
+        video.ltx2_max_short = min(w, h)
+        video.image_max_long_side = max(w, h)
+
+    logger.info(
+        "[GPU preset: %s] ltx2 %dx%d gen → %dx%d output | quant=%s offload=%s "
+        "upsampler=%s seg=%.1fs",
+        gpu_key,
+        video.ltx2_max_long, video.ltx2_max_short,
+        video.ltx2_max_long  * (2 if video.ltx2_use_upsampler else 1),
+        video.ltx2_max_short * (2 if video.ltx2_use_upsampler else 1),
+        video.ltx2_quantization, video.ltx2_offload_mode,
+        video.ltx2_use_upsampler, video.ltx2_segment_seconds,
+    )
+    return video
 
 
 def notebook_safe_4090_video_config(
