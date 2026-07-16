@@ -4141,15 +4141,79 @@ def _finalize_image_prompt(shot: "Shot", prompt: str, theme: str) -> str:
     return prompt
 
 
+# Generic but non-plain environment elaboration, keyed by rough mood/keyword,
+# used ONLY by the emergency fallback builder below when the LLM authoring
+# pass is unavailable/failed. These exist so the fallback path — which used
+# to just echo the bare `shot.setting` string — still produces a layered,
+# imaginative Environment field instead of a flat, empty backdrop. Each entry
+# gives foreground/midground/background texture that can wrap around
+# WHATEVER setting text the shot actually has, rather than replacing it.
+_FALLBACK_ENV_TEXTURE = {
+    "dark":   "Foreground catches scattered highlights against deep shadow. "
+              "Midground recedes into gloom broken by a single light source. "
+              "Background dissolves into near-darkness with a faint horizon line.",
+    "night":  "Foreground is lit by whatever local light source is nearby. "
+              "Midground falls into cool blue shadow. Background shows a "
+              "night sky or distant lights receding into darkness.",
+    "bright": "Foreground is crisply lit with clear detail. Midground carries "
+              "warm ambient light. Background opens into a sunlit horizon "
+              "with visible depth and atmosphere.",
+    "storm":  "Foreground debris and texture caught mid-motion in the wind. "
+              "Midground obscured by blowing rain or dust. Background shows "
+              "roiling storm clouds and a churning sky.",
+    "indoor": "Foreground shows nearby furniture or architectural detail in "
+              "sharp focus. Midground carries the room's working light. "
+              "Background recedes through a doorway or window into a further "
+              "space, giving the room real depth rather than a flat wall.",
+}
+_DEFAULT_FALLBACK_ENV = (
+    "Foreground carries specific, tangible detail near the subject. Midground "
+    "shows the working space of the scene. Background recedes into an "
+    "atmospheric, layered distance rather than a flat backdrop."
+)
+
+
+def _fallback_environment_block(shot: "Shot", theme: str) -> str:
+    """Wrap whatever setting text exists with foreground/midground/background
+    texture so the EMERGENCY fallback path never emits a bare, plain backdrop.
+
+    Never invents a new location — it only adds spatial layering AROUND the
+    setting the shot already specifies (or, if the shot has no setting at
+    all, around the film's theme), which is the single biggest lever for
+    avoiding the "single character, plain background" failure mode when the
+    richer LLM-authored path is unavailable.
+    """
+    base = (shot.setting or "").strip()
+    mood_key = (shot.mood or "").lower()
+    texture = _DEFAULT_FALLBACK_ENV
+    for key, block in _FALLBACK_ENV_TEXTURE.items():
+        if key in mood_key or key in base.lower():
+            texture = block
+            break
+    if base:
+        return f"{base}. {texture}"
+    # No setting at all — lean on the theme so it's still specific to this
+    # film rather than a generic empty room.
+    return f"{theme or 'The scene'}. {texture}"
+
+
 def build_image_prompt(shot: Shot, char_idx: Dict[str, "Character"],
                        theme: str) -> str:
-    """Assemble a KLEIN2 prompt from the shot + the canonical character looks.
+    """EMERGENCY FALLBACK ONLY. Assemble a prompt from the shot + canonical
+    character looks when the LLM-authored structured pass (generate_image_
+    prompts) is unavailable or failed for this shot.
 
-    Leads with each on-screen character's locked gender + physical build so the
-    diffusion model can't drift between shots — the same trick the comic
-    pipeline uses in its panel prompts.
+    This used to be a bare-bones builder (Subject/Action/Environment/Camera/
+    Mood/Style, with Environment being nothing more than the raw shot.setting
+    string) that silently produced flat, plain-background, single-character
+    images whenever the richer path didn't cover a shot. It now always emits
+    all eight labelled sections — including Clothing and Objects, which were
+    previously missing entirely from this path — and layers the Environment
+    field with foreground/midground/background texture (see
+    `_fallback_environment_block`) instead of echoing the bare setting.
     """
     people = []
+    clothing_bits = []
     for nm in shot.characters_in_frame[:3]:
         ch = char_idx.get(nm) or char_idx.get(nm.split()[0] if nm else "")
         if ch:
@@ -4158,29 +4222,46 @@ def build_image_prompt(shot: Shot, char_idx: Dict[str, "Character"],
             appear = getattr(ch, "appearance", "") or ""
             seg = ", ".join(x for x in (g, build, appear) if x)
             people.append(f"{nm} ({seg})" if seg else nm)
+            outfit = getattr(ch, "costume", "") or getattr(ch, "outfit", "") or ""
+            if outfit:
+                clothing_bits.append(f"{nm}: {outfit}")
         elif nm:
             people.append(nm)
     parts = []
     if people:
         parts.append("Subject: " + "; ".join(people))
+    if clothing_bits:
+        parts.append("Clothing: " + "; ".join(clothing_bits))
     visual_desc = _visual_safe_description(shot)
     if visual_desc:
         parts.append("Action: " + visual_desc)
-    if shot.setting:
-        parts.append("Environment: " + shot.setting)
+    # Environment ALWAYS gets spatial layering, even with no setting text —
+    # this is the single change that prevents the plain-backdrop failure mode.
+    parts.append("Environment: " + _fallback_environment_block(shot, theme))
+    # A minimal, generic prop line so Objects is never silently empty; this is
+    # deliberately soft ("if visible") since the fallback has no real prop
+    # knowledge, but an empty Objects section is one of the clearest tells of
+    # a plain, under-specified image.
+    parts.append(
+        "Objects: specific, tangible props consistent with the setting are "
+        "visible nearby, grounding the scene in physical detail."
+    )
     # Anchor the subject's frame position explicitly so the diffusion model
-    # cannot fill empty wide-frame space by duplicating the subject.
+    # cannot fill empty wide-frame space by duplicating the subject — but
+    # phrase it as a positive framing choice rather than bare "single figure,
+    # plain" language, which read as an instruction to keep things minimal.
     cam_base = _COMP_HINT.get(shot.composition or "", "medium shot")
     anchor = (
-        "subject centered, single figure, no duplicate"
+        "one clearly composed subject anchored off-centre against a deep, "
+        "layered background, no duplicate figures"
         if len(shot.characters_in_frame) <= 1
-        else "subjects grouped, no duplicates"
+        else "subjects grouped with the environment visible around and "
+             "behind them, no duplicates"
     )
     parts.append(f"Camera: {cam_base}; {anchor}.")
     if shot.mood:
         parts.append("Mood: " + shot.mood)
-    if theme:
-        parts.append("Style: " + theme)
+    parts.append("Style Details: " + (theme or "cinematic, filmic, richly detailed illustration"))
     return "\n".join(parts)
 
 
@@ -4249,7 +4330,63 @@ _STRUCT_FEWSHOT = (
     "Environment: Foreground — falling snowflakes in sharp focus drifting across the face. Background — a blurred dark winter landscape, out-of-focus and minimal, keeping all attention on the single face.\n"
     "Lighting: Soft directional light from the upper left highlights the forehead and cheekbones; deeper shadows fall under the jawline and eye sockets.\n"
     "Camera: Tight close-up, face filling 80% of the frame, centered; no other figures or subjects.\n"
-    "Style Details: Cinematic composition, hyper-realistic skin texture and frost detail, dramatic atmosphere emphasizing resilience."
+    "Style Details: Cinematic composition, hyper-realistic skin texture and frost detail, dramatic atmosphere emphasizing resilience.\n"
+    "---\n"
+    # --- 6. Multi-character group shot, layered beach environment, named props ---
+    "Animated 3D still life of two companions relaxing together near the ocean\n"
+    "Subject: A smiling young woman in casual clothes seated between her two travelling "
+    "companions, all three at ease with one another.\n"
+    "Clothing: She wears an oversized hoodie with matching shorts and sneakers; one "
+    "companion wears a patterned wrap top and a woven skirt with fringes and a shell "
+    "necklace; the other stands just behind holding a large carved hook-shaped tool.\n"
+    "Action: All three seated or standing close together on a mossy rock, smiling at "
+    "one another, bodies angled inward toward the group.\n"
+    "Environment: Foreground — grass scattered with colourful flowers and a mossy rock "
+    "seat. Midground — the companions grouped on the rock, a small animal at their feet. "
+    "Background — a vibrant tropical shoreline under bright daylight: turquoise ocean "
+    "water, distant palm trees, and pale sandy shoreline stretching to the horizon.\n"
+    "Objects: A large intricately carved hook-shaped tool rests over one companion's "
+    "shoulder; a small animal sits at their feet.\n"
+    "Lighting: Bright natural sunlight from above and slightly in front, casting soft "
+    "shadows on the grass and warm highlights across every face.\n"
+    "Camera: Medium group shot, all three subjects filling the centre of frame, "
+    "shoreline and horizon visible behind them; no extra figures.\n"
+    "Style Details: Polished 3D animation style, smooth textures, expressive faces, "
+    "richly saturated colours, detailed environmental foreground elements.\n"
+    "---\n"
+    # --- 7. Character-driven creature portrait, environment implied through palette ---
+    "Digital art of a feral, chaotic figure with an aggressive presence\n"
+    "Subject: A muscular humanoid figure with a wild pink mohawk styled into two high "
+    "pigtails, pale skin marked with intricate tribal tattoos and bold geometric face "
+    "paint.\n"
+    "Clothing: A textured magenta outfit with jagged zig-zag trim at the hem, layered "
+    "necklaces of bone-shard beads with a skull pendant at the centre chest.\n"
+    "Action: Snarling with mouth open, fangs bared, eyes narrowed in an intense glare "
+    "directed at something just off-frame.\n"
+    "Environment: Foreground — cracked dry ground underfoot. Midground — drifting smoke "
+    "haze at knee height. Background — a blurred, stormy blue sky suggesting an exposed "
+    "outdoor battleground under harsh daylight.\n"
+    "Lighting: Hard overhead daylight, deep contrast shadows carving the face and "
+    "tattoos, a cool rim light separating the figure from the sky behind.\n"
+    "Camera: Medium close-up, figure slightly off-centre, shoulders filling the lower "
+    "frame; no other figures.\n"
+    "Style Details: High-detail digital illustration, saturated tribal colour accents, "
+    "gritty painterly rendering with sharp linework.\n"
+    "---\n"
+    # --- 8. Pure-environment establishing shot, no human figure, mythic scale ---
+    "3D render of a majestic dragon-like presence emerging from stormy clouds\n"
+    "Subject: A powerful eastern-style dragon head with layered coral-red horns, a "
+    "voluminous white mane like flowing silk, and a single amber eye reflecting the sky.\n"
+    "Environment: Foreground — swirling mist at the base of the frame. Midground — the "
+    "dragon's mane and horns catching the light. Background — deep grey cumulus storm "
+    "clouds contrasting soft illuminated cloud layers, small stylized birds flying near "
+    "the snout for scale.\n"
+    "Lighting: Soft directional light from the upper left casting gentle shadows across "
+    "the scales, warm red tones on the face against cooler whites along the neck.\n"
+    "Camera: Wide low-angle shot, the head and horns filling the upper two-thirds of the "
+    "frame, clouds receding into deep background; no human figures.\n"
+    "Style Details: Intricate traditional-dragon-art detailing blended with modern "
+    "digital rendering, vibrant reds paired with clean whites, dramatic mythic scale."
 )
 
 
@@ -4546,7 +4683,7 @@ def _arc_phase_for_shot(arc_map: List[Dict], shot_index: int, n_shots: int) -> D
 # ---------------------------------------------------------------------------
 _PROMPT_REVIEW_PREFIX = (
     "You are the art director reviewing a batch of image-generation prompts for "
-    "a short animated film. Your job is quality control across three dimensions:\n"
+    "a short animated film. Your job is quality control across four dimensions:\n"
     "1. STORY SERVICE: does this shot's visual description actually serve its "
     "narrative moment, or is it generic? A climax shot and an opening shot with "
     "the same mood word should look completely different.\n"
@@ -4554,9 +4691,17 @@ _PROMPT_REVIEW_PREFIX = (
     "shots have identical framing, identical lighting direction, and identical "
     "colour temperature, flag the second and suggest one specific change.\n"
     "3. LOCK CONSISTENCY: does anything in the prompt contradict the character's "
-    "locked appearance, the established setting, or the film's visual treatment?\n\n"
+    "locked appearance, the established setting, or the film's visual treatment?\n"
+    "4. IMAGINATIVE DEPTH — REJECT PLAIN SHOTS: flag any prompt whose Environment "
+    "reads as a bare, empty, or generic backdrop (e.g. just a location name with no "
+    "foreground/midground/background detail), or whose Objects field is empty or "
+    "missing, or that would render as a single flat character with nothing else "
+    "in frame. This is the single most important check — a technically correct "
+    "but plain prompt still fails review. Revise it to add specific, concrete "
+    "environmental and object detail consistent with the story world; never "
+    "invent detail that contradicts the narrative or the locked setting.\n\n"
     "You return targeted, surgical revisions — change the minimum necessary to fix "
-    "the problem. Do not rewrite prompts that already pass all three checks. "
+    "the problem. Do not rewrite prompts that already pass all four checks. "
     "Never alter: character gender/build/appearance locks, the style field, "
     "the camera anchoring, mouth-visibility constraints, or hands-away cues."
 )
@@ -4973,31 +5118,209 @@ def generate_image_prompts(shots: List[Shot], characters: List["Character"],
         )
         data = None
         if _HAS_NG:
-            try:
-                # cached_prefix holds the stable instruction scaffold (identical
-                # across all batches); variable_part holds only what changes per
-                # batch. Grok serves the prefix from cache after the first call.
-                raw = ng.get_openai_prompt_response(
-                    variable_part,
-                    temperature=0.88,
-                    openai_model=getattr(ng, "openai_model_large", None),
-                    use_grok=getattr(ng, "USE_GROK", True),
-                    cached_prefix=_cached_prefix,
-                )
-                data = ng.parse_json_response(raw)
-                if isinstance(data, dict):
-                    data = data.get("shots") or data.get("prompts") or []
-            except Exception as e:
-                logger.debug("  image-prompt batch failed (%s) — using assembler.", e)
+            # Up to two attempts: a transient network hiccup or a single
+            # malformed-JSON response used to silently degrade the WHOLE
+            # batch to the plain emergency fallback (see build_image_prompt).
+            # One retry with a stricter reminder recovers the large majority
+            # of those cases before we ever fall back.
+            for attempt in range(2):
+                try:
+                    # cached_prefix holds the stable instruction scaffold
+                    # (identical across all batches); variable_part holds only
+                    # what changes per batch. Grok serves the prefix from
+                    # cache after the first call.
+                    _part = variable_part
+                    if attempt == 1:
+                        _part += (
+                            "\n\nREMINDER: return ONLY the JSON array, no prose, "
+                            "no markdown fences, one object per shot index."
+                        )
+                    raw = ng.get_openai_prompt_response(
+                        _part,
+                        temperature=0.88 if attempt == 0 else 0.6,
+                        openai_model=getattr(ng, "openai_model_large", None),
+                        use_grok=getattr(ng, "USE_GROK", True),
+                        cached_prefix=_cached_prefix,
+                    )
+                    parsed = ng.parse_json_response(raw)
+                    if isinstance(parsed, dict):
+                        parsed = parsed.get("shots") or parsed.get("prompts") or []
+                    if isinstance(parsed, list) and parsed:
+                        data = parsed
+                        break
+                except Exception as e:
+                    if attempt == 0:
+                        logger.debug(
+                            "  image-prompt batch (shots %s) attempt 1 failed "
+                            "(%s) — retrying once.",
+                            [s.index for s in batch], e,
+                        )
+                    else:
+                        logger.warning(
+                            "  [PROMPTS] image-prompt batch (shots %s) failed "
+                            "after retry (%s) — these shots will use the "
+                            "plain emergency fallback builder. If this "
+                            "happens often, check API rate limits / JSON "
+                            "parsing for this model.",
+                            [s.index for s in batch], e,
+                        )
         by_i = {int(o.get("i", -1)): o for o in (data or []) if isinstance(o, dict)}
+        _fell_back = []
         for k, sh in enumerate(batch):
             o = by_i.get(k)
             if o:
                 sh.image_prompt = _render_structured_prompt(o.get("summary", ""), o)
             if not sh.image_prompt:
                 sh.image_prompt = build_image_prompt(sh, idx, theme)
+                _fell_back.append(sh.index)
             sh.image_prompt = _finalize_image_prompt(sh, sh.image_prompt, theme)
+        if _fell_back:
+            logger.warning(
+                "  [PROMPTS] shots %s used the plain emergency fallback "
+                "builder (no LLM-authored prompt available for these).",
+                _fell_back,
+            )
     logger.info("[PROMPTS] structured image prompts ready for %d shots.", len(shots))
+    _ensure_prompt_richness(shots, theme, visual_treatment)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic richness gate — catches "single character, plain background"
+# ---------------------------------------------------------------------------
+# review_and_revise_image_prompts() (below) is a pure LLM-judgment critic pass:
+# it can miss things, silently no-ops on a batch failure, and costs an LLM call
+# per batch. This gate is the cheap, zero-LLM-cost, deterministic backstop that
+# runs on EVERY shot right after prompts are authored — whether they came from
+# the rich LLM-authored path or the plain emergency fallback — and repairs the
+# two structural tells of a plain image: a missing/short/unlayered Environment
+# section, and an empty Objects section.
+_RICHNESS_MIN_ENV_WORDS = 12
+_RICHNESS_ENV_LAYER_WORDS = ("foreground", "midground", "background", "behind", "surrounding", "beyond")
+_STRUCT_LABEL_KEYS = ("subject", "clothing", "action", "pose & placement", "pose",
+                     "environment", "objects", "lighting", "camera", "style", "style details")
+
+
+def _prompt_sections(prompt: str) -> Dict[str, str]:
+    """Parse a labelled structured prompt into {lower_case_label: body_text}."""
+    out: Dict[str, str] = {}
+    for ln in (prompt or "").split("\n"):
+        if ":" not in ln:
+            continue
+        label, _, body = ln.partition(":")
+        label = label.strip().lower()
+        if label in _STRUCT_LABEL_KEYS:
+            out[label] = body.strip()
+    return out
+
+
+def _is_environment_thin(env_text: str) -> bool:
+    """True if an Environment section is missing, short, or has no spatial
+    layering language — the direct structural signature of a plain backdrop."""
+    if not env_text or not env_text.strip():
+        return True
+    if len(env_text.split()) < _RICHNESS_MIN_ENV_WORDS:
+        return True
+    low = env_text.lower()
+    return not any(w in low for w in _RICHNESS_ENV_LAYER_WORDS)
+
+
+def _replace_or_append_section(prompt: str, label: str, body: str) -> str:
+    """Set a labelled section's body, replacing it in place if present or
+    appending a new line if absent. Preserves every other line untouched."""
+    pattern = re.compile(rf"(?im)^{re.escape(label)}\s*:.*$")
+    if pattern.search(prompt):
+        return pattern.sub(f"{label}: {body}", prompt, count=1)
+    return prompt.rstrip() + f"\n{label}: {body}"
+
+
+def _ensure_prompt_richness(shots: List["Shot"], theme: str,
+                            visual_treatment: Optional[Dict[str, str]] = None) -> None:
+    """Deterministic quality gate: run once, right after every image prompt is
+    authored (LLM-authored or emergency-fallback alike), before the LLM critic
+    pass. Directly targets the "single character, plain background" failure
+    mode with zero additional LLM calls:
+
+      1. Environment thin/missing → layer it with foreground/midground/
+         background texture (reuses `_fallback_environment_block`, merging
+         with any real content already present rather than discarding it).
+      2. Objects empty → fill with a concrete, setting-appropriate filler
+         line (pulls the film's texture motif from the visual treatment when
+         available) so a panel is never rendered with zero named props.
+      3. When comic_book_generator is importable, also runs its own
+         lighting/colour/camera/texture/mood-coda gap-filling
+         (`_enrich_prompt_with_few_shot_patterns`) on every prompt — the same
+         "art director" enrichment logic the comic-panel pipeline uses,
+         reused here rather than reimplemented.
+
+    Safe to call on an empty or partially-authored shot list; skips any shot
+    with no image_prompt at all (nothing to enrich yet).
+    """
+    if not shots:
+        return
+    treatment = visual_treatment or {}
+    n_enriched = 0
+    for sh in shots:
+        prompt = sh.image_prompt or ""
+        if not prompt.strip():
+            continue
+        sections = _prompt_sections(prompt)
+        env = sections.get("environment", "")
+        objects = sections.get("objects", "")
+        changed = False
+
+        if _is_environment_thin(env):
+            layered = _fallback_environment_block(sh, theme)
+            merged = (
+                f"{env}. {layered}"
+                if env and env.strip().rstrip('.').lower() not in layered.lower()
+                else layered
+            )
+            prompt = _replace_or_append_section(prompt, "Environment", merged)
+            changed = True
+
+        if not objects.strip():
+            filler = (
+                "specific, tangible props consistent with the setting are "
+                "visible nearby, grounding the scene in physical detail."
+            )
+            motif = treatment.get("texture_motif", "")
+            if motif:
+                filler = f"{motif}; {filler}"
+            prompt = _replace_or_append_section(prompt, "Objects", filler)
+            changed = True
+
+        if changed:
+            sh.image_prompt = prompt
+            n_enriched += 1
+
+        # Reuse the comic pipeline's own art-director gap-filling (lighting /
+        # colour / camera / texture / mood-coda) — same logic, no duplication.
+        if _HAS_CBG and hasattr(cbg, "_enrich_prompt_with_few_shot_patterns"):
+            try:
+                panel_like = {
+                    "composition": sh.composition or "",
+                    "mood": sh.mood or "",
+                    "characters_in_frame": sh.characters_in_frame or [],
+                    "_arc_emotion": sh.mood or "",
+                    "_arc_intensity": 0.5,
+                }
+                is_cosmic = not sh.characters_in_frame
+                sh.image_prompt = cbg._enrich_prompt_with_few_shot_patterns(
+                    sh.image_prompt, panel_like,
+                    grammar_label=theme or "", is_cosmic=is_cosmic,
+                )
+            except Exception as e:
+                logger.debug(
+                    "[Richness] cbg enrichment skipped for shot %s (%s).",
+                    sh.index, e,
+                )
+
+    if n_enriched:
+        logger.info(
+            "[Richness] Layered environment and/or filled objects for %d/%d "
+            "shot prompts (were thin, unlayered, or missing).",
+            n_enriched, len(shots),
+        )
 
 
 def _clip_prompt(text: str, max_chars: int) -> str:
