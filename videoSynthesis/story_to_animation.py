@@ -145,7 +145,7 @@ SINGLE-IMAGE TALKING VIDEO
 '''
 
 from __future__ import annotations
-STORY_TO_ANIMATION_PATCH_LEVEL = "notebook-styleanchor-mouthvis-imgmatch-fatalgpu-earlybail-charseed-lipsyncmotion-expressive-voice-image-higgs-placement-affirmativemouth-mouthvisdetect-stylizedrelax-narratorgate-cbgactionseq-fpsyncsave-fpdtype-fpvaeslice-nospeakmotion-fpwritevideo-nospeakplan-nospeakllm-ltx2engine-ltx2setup-ltx2abspath-ltx2fp8prequant-2026-07-09"
+STORY_TO_ANIMATION_PATCH_LEVEL = "ltx2engine-ltx2setup-ltx2abspath-ltx2fp8prequant-2026-07-09"
 
 import os
 os.environ.setdefault("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "1")
@@ -419,7 +419,7 @@ class VideoConfig:
     # before animation starts. Example: project 960x544 → image stills 960x576.
     image_resolution_multiple: int = 64
     image_resolution_rounding: str = "ceil"    # ceil | floor | nearest
-    image_max_long_side: int = 960             # default cap for still generation (3090)
+    image_max_long_side: int = 1280             # default cap for still generation (3090)
     # ── LTX-2 generation resolution ──────────────────────────────────────────
     # apply_gpu_preset() sets these (and vcfg.width/height) together so that
     # every part of the pipeline — image generation, LTX2._resolution(), compose,
@@ -433,8 +433,8 @@ class VideoConfig:
     # apply_gpu_preset() for a different card.  Override ltx2_max_long/short
     # here (or pass gen_width/gen_height to apply_gpu_preset) to use a custom
     # resolution; remember that LTX-2 requires dimensions to be multiples of 16.
-    ltx2_max_long: int = 960                   # generation long-side ceiling for LTX-2
-    ltx2_max_short: int = 576                  # generation short-side ceiling for LTX-2
+    ltx2_max_long: int = 1280                   # generation long-side ceiling for LTX-2
+    ltx2_max_short: int = 720                  # generation short-side ceiling for LTX-2
     ltx2_use_upsampler: bool = False           # upsampler disabled by default; presets
     #   set this explicitly. True → output is 2× the generation dims.
     # Wan2.2-S2V's local repo (auto-cloned/downloaded here if missing)
@@ -556,7 +556,7 @@ class VideoConfig:
     ltx2_spatial_upsampler: str = ""            # ltx-2.3-spatial-upscaler-x2-1.1.safetensors (1GB)
     ltx2_distilled_lora: str = ""               # ltx-2.3-22b-distilled-lora-384-1.1.safetensors
                                                  # only needed with the DEV (non-distilled) checkpoint
-    ltx2_distilled_lora_strength: float = 0.8
+    ltx2_distilled_lora_strength: float = 1.0
     ltx2_gemma_root: str = ""                   # dir of google/gemma-3-12b-it-qat-q4_0-unquantized
     # Quantization — RTX 3090 (Ampere) recommendation:
     #   CHECKPOINT CHOICE MATTERS ON RTX 3090 (Ampere, no native FP8 tensor cores):
@@ -705,6 +705,25 @@ class VideoConfig:
     # scene_transition_seconds and this ratio × the shorter neighbour.
     scene_transition_max_ratio: float = 0.5
     scene_transition_min_seconds: float = 0.12   # below this, just hard-cut
+    # ── Final concat batching (see _concat_copy) ─────────────────────────────
+    # Every shot clip is joined via an ffmpeg filter-concat pass that opens
+    # each input as a live decoder for the whole call — fine for a handful of
+    # clips, but hundreds of simultaneous decoders is what drives long runs
+    # to crawl or OOM. Above this many clips, they're merged in batches of
+    # this size (recursively), each batch running as its own bounded ffmpeg
+    # call, batches parallelized across CPU cores.
+    #   • 40 (default) is a safe middle ground on a typical desktop (16–32GB
+    #     RAM): bounds any single ffmpeg call to ~40 open decoders while
+    #     keeping the extra re-encode overhead from the tree small.
+    #   • Drop to 15-20 if you're on a machine with <16GB RAM, are seeing
+    #     ffmpeg get OOM-killed, or hit "too many open files".
+    #   • Raise to 60-100 if you have 64GB+ RAM and want fewer merge levels
+    #     (marginally less re-encode generation loss, slightly more memory
+    #     per batch).
+    # Rule of thumb: keep it comfortably under 100 regardless of RAM — very
+    # large filter_complex graphs get slow to build/parse in ffmpeg itself,
+    # independent of memory.
+    concat_batch_size: int = 40
     # ── Lip-sync post-processing ─────────────────────────────────────────────
     # After animation, re-sync dialogue shots' mouths to the generated speech.
     # match lips to audio on their own; this stage fixes that. Wan-S2V already
@@ -867,6 +886,29 @@ class ProjectConfig:
     #    and lock-consistency. Flagged prompts are revised in-place.
     prompt_review: bool = True
     prompt_review_batch_size: int = 6
+    # Review batches are independent of each other (each only needs its own
+    # shots plus the already-finalized previous shot's prompt text — see
+    # review_and_revise_image_prompts), so they run concurrently instead of
+    # one-at-a-time. Cap kept modest to stay polite to API rate limits.
+    prompt_review_max_workers: int = 5
+    # Trade wall-clock time for a flat cost discount (stacks with prompt-cache
+    # savings) by submitting the whole review pass as one xAI Batch API job
+    # instead of live calls. Off by default since batch turnaround is "up to
+    # ~24h, not guaranteed" — turn on for offline/overnight runs where cost
+    # matters more than getting the plan back quickly.
+    prompt_review_use_batch_api: bool = False
+    # Which shots the critic pass reviews. "flagged" (default) = only those
+    # the free deterministic QC gate (_qc_flag_prompts) marks as defective;
+    # "all" = every shot, as before. "flagged" leans on the authoring pass's
+    # coach block to prevent problems and uses the critic only to repair what
+    # verification actually catches, cutting critic calls by roughly the
+    # pass-rate of the coaching.
+    prompt_review_scope: str = "flagged"
+    # Submit the whole image-prompt authoring pass as one xAI Batch API job.
+    # Possible because the continuity cue is now deterministic (see
+    # _prev_shot_brief), so no batch depends on another batch's output.
+    # Same tradeoff as prompt_review_use_batch_api: much cheaper, much slower.
+    image_prompts_use_batch_api: bool = False
     # 5. Shot-to-shot connective tissue: each image prompt receives a one-line
     #    summary of the previous shot so colour, eyeline, and compositional
     #    echoes can carry across the cut.
@@ -1327,6 +1369,63 @@ def _emotion_from_bubble(bubble_type: str, emphasis: str = "normal") -> str:
     if emphasis == "emphasized" and emo == "neutral":
         emo = "emphatic"
     return emo
+
+
+def _call_compat(fn, *args, _inert_when: Optional[Dict[str, Any]] = None, **kwargs):
+    """Call ``fn`` with only the keyword arguments it actually accepts.
+
+    Third-party add-ons monkeypatch pipeline functions by replacing them with
+    wrappers that mirror the signature as it existed when the add-on was
+    written (e.g. ltx23_prompt_guide.apply() replacing
+    generate_image_prompts). When a NEW optional kwarg is added here, those
+    older wrappers raise
+    ``TypeError: ... got an unexpected keyword argument '<new_kwarg>'``
+    and take the whole run down — even though the kwarg is optional and the
+    wrapper would work fine without it.
+
+    So: introspect the target and pass only what it can take. A wrapper that
+    forwards **kwargs gets everything (no filtering needed); one with a fixed
+    signature gets the supported subset.
+
+    ``_inert_when`` maps kwarg name -> the value at which dropping it is a
+    genuine no-op (usually its default, e.g. ``{"use_batch_api": False}``).
+    Dropping a kwarg at that value changes nothing, so it's logged at DEBUG;
+    dropping one set to anything else DOES silently disable a feature the
+    caller asked for, so that's a WARNING. Without this split every run under
+    an older wrapper would emit warnings about flags nobody turned on.
+    """
+    import inspect
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(*args, **kwargs)      # builtins/C-callables: just try it
+
+    params = sig.parameters.values()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+        return fn(*args, **kwargs)      # accepts **kwargs — nothing to filter
+
+    accepted = {p.name for p in params
+                if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                              inspect.Parameter.KEYWORD_ONLY)}
+    inert = _inert_when or {}
+    dropped = sorted(set(kwargs) - accepted)
+    name = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+    active = [d for d in dropped if d not in inert or kwargs[d] != inert[d]]
+    quiet = [d for d in dropped if d not in active]
+    if quiet:
+        logger.debug("%s does not accept %s; they were at their inert default "
+                     "so dropping them is a no-op.",
+                     name, ", ".join(repr(d) for d in quiet))
+    if active:
+        logger.warning(
+            "%s does not accept %s — those arguments were IGNORED, so the "
+            "feature(s) they enable are INACTIVE for this run. This means the "
+            "function has been monkeypatched by an add-on whose wrapper "
+            "predates them; add **kwargs to that wrapper (and forward it) to "
+            "re-enable them.",
+            name, ", ".join(f"{d}={kwargs[d]!r}" for d in active),
+        )
+    return fn(*args, **{k: v for k, v in kwargs.items() if k in accepted})
 
 
 def _run_ffmpeg(args: List[str]):
@@ -2084,18 +2183,58 @@ def list_character_voice_folder_descriptions(
     ]
 
 
+# Descriptive fields that exist mainly to help voice casting (folder-name /
+# AI matching) — e.g. occupation + nationality + age-bracket words that show
+# up literally in a folder name like Carla_ProjectManager_India_Female.
+# name/gender/physical_build/appearance/dialect/cadence/vocabulary_level/
+# speech_pattern/voice_profile are handled separately (they're also used for
+# non-voice purposes), so this list is deliberately just the "extra" ones.
+# Shared by _character_voice_match_text (read), _char_dict (write to plan),
+# and _PlanCharacter (read back from plan) so none of them can silently drift
+# out of sync with the others the way `role` previously did (written to the
+# plan but never read back on a resumed run).
+_VOICE_MATCH_EXTRA_FIELDS = (
+    "role", "occupation", "job", "profession", "archetype", "age",
+    "age_range", "age_bracket", "nationality", "ethnicity", "origin",
+    "hometown", "culture", "region", "accent", "personality",
+    "wound", "longing",
+)
+
+
 def _character_voice_match_text(ch: "Character") -> str:
-    """Text used to match a character to a folder voice description."""
+    """Text used to match a character to a folder voice description.
+
+    Folder names are often built from concrete, literal traits — occupation,
+    nationality/origin, age bracket, gender — e.g. a folder named
+    ``Carla_ProjectManager_India_Female`` for "a female project manager from
+    India in her 30s". getattr(..., "") is safe against Character schemas
+    that don't define a given field (it just contributes nothing), so this
+    list is intentionally generous rather than narrow.
+    """
     bits = []
     for attr in (
-        "name", "gender", "role", "archetype", "age", "physical_build",
-        "appearance", "personality", "voice_profile", "speech_pattern",
-        "cadence", "dialect", "vocabulary_level", "wound", "longing",
+        ("name", "gender", "physical_build", "appearance", "voice_profile",
+         "speech_pattern", "cadence", "dialect", "vocabulary_level")
+        + _VOICE_MATCH_EXTRA_FIELDS
     ):
         v = getattr(ch, attr, "") or ""
         if v:
             bits.append(f"{attr}: {v}")
     return " | ".join(str(b) for b in bits)
+
+
+def _canon_gender(s: str) -> str:
+    """Canonicalize a gender label/description to 'male'/'female'/'nonbinary'
+    (or the lowercased raw string if unrecognized) for EXACT comparison.
+
+    Existed before as a raw substring check (`eg in g or g in eg`), which
+    silently treats 'male' as a match for 'female' — "female" literally
+    contains the substring "male" (fe+male) — and 'man' as a match for
+    'woman'. That inflated the score for opposite-gender folders by the same
+    +12 a real match gets, instead of the -8 mismatch penalty right below it.
+    """
+    s = (s or "").strip()
+    return _infer_gender_from_voice_description(s) or s.lower()
 
 
 def _score_folder_voice_entry(entry: Dict[str, Any], ch: "Character") -> int:
@@ -2105,12 +2244,12 @@ def _score_folder_voice_entry(entry: Dict[str, Any], ch: "Character") -> int:
     char_text = _character_voice_match_text(ch).lower()
     score = 0
 
-    g = (getattr(ch, "gender", "") or "").lower()
-    eg = (entry.get("gender") or "").lower()
+    g = _canon_gender(getattr(ch, "gender", ""))
+    eg = _canon_gender(entry.get("gender", ""))
     if g and eg:
-        if eg in g or g in eg:
+        if g == eg:
             score += 12
-        elif eg in ("male", "female") and g in ("male", "female") and eg != g:
+        elif eg in ("male", "female") and g in ("male", "female"):
             score -= 8
 
     # Direct token overlap, excluding filler.
@@ -2146,6 +2285,70 @@ def _score_folder_voice_entry(entry: Dict[str, Any], ch: "Character") -> int:
     return score
 
 
+# Titles/honorifics that legitimately show up on ONE side of a name match
+# (usually the folder: "Donald_Trump_President") but not the other, and
+# shouldn't block an otherwise-clear match.
+_NAME_MATCH_STOPWORDS = {
+    "the", "of", "mr", "mrs", "ms", "dr", "jr", "sr", "president",
+    "former", "ex", "hon", "sir", "dame", "lord", "lady", "rev", "prof",
+}
+
+
+def _name_match_tokens(s: str) -> frozenset:
+    s = re.sub(r"[_\-.]+", " ", str(s or ""))
+    toks = re.findall(r"[a-zA-Z0-9]+", s.lower())
+    # len > 1 drops middle initials ("J.") along with the stopword filter.
+    return frozenset(t for t in toks if len(t) > 1 and t not in _NAME_MATCH_STOPWORDS)
+
+
+def _name_folder_match(ch: "Character", candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A voice folder deliberately named after a character — e.g. a folder
+    called ``Donald_Trump_President`` for a character named "Donald J.
+    Trump" — is an unambiguous, intentional signal, not something that
+    should be left to the AI picker's softer archetype/personality
+    reasoning. The AI has no way to know a folder was named FOR this
+    specific character on purpose, and can reasonably (but wrongly, for this
+    purpose) gravitate toward a more generic archetype-sounding folder
+    instead (e.g. "grumpy old man"), or — worse — toward another character's
+    folder entirely if it's processed first (e.g. a character named "Spirit"
+    grabbing the Trump folder, leaving the real Trump character matched to
+    an Obama folder). Checked BEFORE the AI runs, and — see cast_voices —
+    reserved across the WHOLE cast before any other character's AI/archetype
+    pass gets a turn, so being processed later never costs a character its
+    own name-intended folder.
+
+    Matches on token-SET containment (one side fully contained in the
+    other) rather than raw substring/equality, after stripping honorifics
+    and single-letter tokens from both sides — strict enough that unrelated
+    multi-word folders sharing one common word (e.g. a surname) don't
+    false-positive, but loose enough to survive a middle initial, "Jr.", or
+    a title like "President" on either side.
+    """
+    name_toks = _name_match_tokens(getattr(ch, "name", ""))
+    if not name_toks:
+        return None
+    exact, contained = None, None
+    for e in candidates:
+        folder_toks = _name_match_tokens(e.get("id", ""))
+        if not folder_toks:
+            continue
+        if folder_toks == name_toks:
+            exact = e
+            break
+        # A single-token name (just "Grace") is common enough that requiring
+        # only containment would let it claim any folder that happens to
+        # mention that word at all (e.g. "Amazing_Grace_Old_Woman", a folder
+        # that may have nothing to do with a character named Grace). Require
+        # full equality for single-token names; reserve the looser
+        # containment match (which absorbs titles/initials/suffixes) for
+        # names with 2+ tokens, which are far less likely to collide by
+        # coincidence.
+        if len(name_toks) >= 2 and (folder_toks <= name_toks or name_toks <= folder_toks):
+            if contained is None:
+                contained = e
+    return exact or contained
+
+
 def _ai_pick_folder_voice(ch: "Character", candidates: List[Dict[str, Any]]) -> Optional[str]:
     """Ask the LLM to pick one candidate id. Returns folder id or None."""
     if not (_HAS_NG and candidates):
@@ -2164,7 +2367,20 @@ def _ai_pick_folder_voice(ch: "Character", candidates: List[Dict[str, Any]]) -> 
         "You are casting a character voice from a local folder of reference voices. "
         "Each option's folder name is the voice description. Pick exactly ONE unused "
         "voice id that best matches the character's gender, age, role, personality, "
-        "and likely vocal tone. Do not pick randomly; prefer a good archetype match. "
+        "and likely vocal tone. "
+        "IMPORTANT: if any option's folder name IS (or clearly refers to) the "
+        "character's own name — e.g. a folder called 'Donald_Trump' for a character "
+        "named 'Donald Trump' — that folder was deliberately recorded/prepared for "
+        "this character and must be picked over any generic archetype-sounding "
+        "folder (like 'grumpy old man'), even if the archetype folder also seems "
+        "like a plausible personality fit. A named match always outranks an "
+        "archetype match. "
+        "Folder names also often encode concrete, literal traits as separate words "
+        "— occupation, nationality/origin, age bracket, gender — e.g. "
+        "'Carla_ProjectManager_India_Female' for a character described as a female "
+        "project manager from India in her 30s. Weigh a folder that matches several "
+        "of these concrete traits over one that only 'feels' right on vibe/archetype "
+        "alone. Do not pick randomly; prefer the best overall match. "
         "Return ONLY JSON like {\"id\":\"Folder_Name\", \"reason\":\"brief reason\"}.\n\n"
         f"CHARACTER:\n{_character_voice_match_text(ch)}\n\n"
         f"AVAILABLE VOICES:\n{json.dumps(options, ensure_ascii=False, indent=2)}"
@@ -2192,6 +2408,12 @@ def _pick_folder_voice(ch: "Character", candidates: List[Dict[str, Any]],
                        cfg: "TTSConfig") -> Optional[Dict[str, Any]]:
     if not candidates:
         return None
+
+    exact = _name_folder_match(ch, candidates)
+    if exact:
+        logger.info("  voice(folder_match): %-22s name match -> folder %r",
+                    getattr(ch, "name", ch), exact.get("id", ""))
+        return exact
 
     pick_id = _ai_pick_folder_voice(ch, candidates) if cfg.use_ai_folder_voice_matching else None
     if pick_id:
@@ -2239,11 +2461,12 @@ def _descriptor_for(char: "Character") -> str:
 def _score_bank_entry(entry: Dict[str, Any], char: "Character") -> int:
     desc = _descriptor_for(char).lower()
     score = 0
-    g = (getattr(char, "gender", "") or "").lower()
-    if g and entry.get("gender"):
-        if entry["gender"] in g or g in entry["gender"]:
+    g = _canon_gender(getattr(char, "gender", ""))
+    eg = _canon_gender(entry.get("gender", ""))
+    if g and eg:
+        if g == eg:
             score += 5
-        else:
+        elif eg in ("male", "female") and g in ("male", "female"):
             score -= 4
     for tag in entry.get("tags", []):
         if tag and len(tag) > 2 and tag in desc:
@@ -2281,6 +2504,29 @@ def cast_voices(characters: List["Character"], cfg: TTSConfig,
     profiles: Dict[str, VoiceProfile] = {}
     n_baseline = 0
 
+    # Reserve name-matched folders for their rightful character FIRST, across
+    # the WHOLE cast, before anyone's AI/archetype pass runs. Characters are
+    # cast one at a time below in list order, and each one immediately locks
+    # in whatever folder it picks — so without this pre-pass, a character
+    # with only a vague personality/archetype fit but an earlier position in
+    # the list (e.g. "Spirit") can grab a folder that was clearly named for a
+    # DIFFERENT, later character (e.g. "Donald_Trump_President", meant for
+    # "Donald J. Trump"). The rightful character then finds its own folder
+    # already gone and gets whatever's left — which can be a wildly wrong
+    # match (Trump matched to an Obama-labeled folder). Doing every name
+    # match in one pass up front, independent of cast order, prevents that.
+    name_reserved: Dict[str, Dict[str, Any]] = {}
+    if mode == "folder_match" and folder_bank:
+        for ch in characters:
+            name = getattr(ch, "name", str(ch))
+            avail = [e for e in folder_bank if e["path"] not in used_bank]
+            match = _name_folder_match(ch, avail)
+            if match:
+                used_bank.add(match["path"])
+                name_reserved[name] = match
+                logger.info("  voice(folder_match): %-22s reserved by name match -> folder %r "
+                            "(before archetype casting begins)", name, match.get("id", ""))
+
     def random_bank_pick(seed: int):
         avail = [e for e in bank if e["path"] not in used_bank]
         if not avail:
@@ -2298,6 +2544,9 @@ def cast_voices(characters: List["Character"], cfg: TTSConfig,
         return avail[0]
 
     def best_folder_voice_match(ch):
+        name = getattr(ch, "name", str(ch))
+        if name in name_reserved:
+            return name_reserved[name]
         avail = [e for e in folder_bank if e["path"] not in used_bank]
         picked = _pick_folder_voice(ch, avail, cfg)
         if picked:
@@ -4707,6 +4956,160 @@ _PROMPT_REVIEW_PREFIX = (
 )
 
 
+# ---------------------------------------------------------------------------
+# xAI Batch API — trade latency for a flat cost discount
+# ---------------------------------------------------------------------------
+# https://docs.x.ai/developers/advanced-api-usage/batch-api
+#
+# The batch discount (20% for grok-4.3 as of this writing) applies to EVERY
+# token type — input, output, AND already-cached tokens — so it stacks on top
+# of whatever prompt-cache discount a pass is already getting; it isn't an
+# either/or with cached_prefix. The tradeoff is turnaround: xAI's own
+# guidance is "typically within 24 hours" and NOT guaranteed, with no
+# per-minute rate limit (good for a big one-shot dump, useless for anything
+# that needs a result in the next few seconds).
+#
+# This only pays off for a pass whose calls are ALL independent of each
+# other — you must submit every request up front, so anything that threads
+# state from one call's output into the next call's input (like
+# generate_image_prompts' batch-to-batch continuity carry) can't use this
+# without giving up that threading. review_and_revise_image_prompts' batches
+# have no such dependency (each only reads the globally-already-finalized
+# shot list), which is why it's the one wired up to use this below.
+#
+# Raw REST (no xai_sdk dependency — reuses the `requests` library already
+# imported by novel_generator.py) via the JSONL-file-upload path, since that
+# lets us reuse the exact same chat/completions message shape
+# get_openai_prompt_response already sends (same system prompt, same
+# structure), rather than switching to the newer Responses API shape the
+# inline-request examples in the docs use.
+_XAI_BATCH_BASE = "https://api.x.ai/v1"
+_XAI_BATCH_SYSTEM_PROMPT = (
+    "You are an expert novelist and editor with deep knowledge of "
+    "literary craft, pacing, character voice, and commercial fiction. "
+    "You write prose that is vivid, emotionally resonant, and commercially appealing. "
+    "You never use em-dashes. You use double spaces between sentences. "
+    "All dialogue uses straight quotation marks."
+)
+
+
+def _grok_batch_map(prompts: List[str], *, model: str,
+                    temperature: float = 0.4, max_tokens: int = 8000,
+                    batch_name: str = "story_to_animation",
+                    poll_interval: float = 5.0,
+                    timeout_s: float = 24 * 3600) -> List[str]:
+    """Submit every string in ``prompts`` as ONE xAI batch job; block until it
+    finishes (or times out); return completions in the SAME order as input.
+
+    Each prompt is sent as its own {system, user} chat/completions request —
+    same shape ng.get_openai_prompt_response sends, just async/bulk. A failed
+    or missing individual result comes back as "" so callers can treat it
+    exactly like a failed synchronous call.
+
+    NOT tested against the live xAI API from this environment (no network
+    egress to api.x.ai here) — built directly from the current docs, but
+    validate against a small batch (a handful of prompts) before trusting it
+    on a full run, in case a field name has since shifted.
+
+    Blocks the calling thread for the whole batch. Call this from a place
+    that's genuinely OK waiting — never from an interactive/latency-sensitive
+    path.
+    """
+    import requests  # local import: only needed if batch mode is actually used
+
+    api_key = (getattr(ng, "grok_api_key", "") if _HAS_NG else "") or os.getenv("XAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("No xAI API key available (ng.grok_api_key / XAI_API_KEY) for batch submission.")
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    lines = []
+    for i, p in enumerate(prompts):
+        body = {
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": _XAI_BATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": p},
+            ],
+        }
+        lines.append(json.dumps({
+            "custom_id": f"req_{i}",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": body,
+        }))
+    jsonl_content = "\n".join(lines)
+
+    up = requests.post(
+        f"{_XAI_BATCH_BASE}/files", headers=headers,
+        files={"file": ("batch_requests.jsonl", jsonl_content, "application/jsonl")},
+        timeout=120,
+    )
+    up.raise_for_status()
+    file_id = up.json().get("id") or up.json().get("file_id")
+
+    cb = requests.post(
+        f"{_XAI_BATCH_BASE}/batches", headers=headers,
+        json={"name": batch_name, "input_file_id": file_id}, timeout=60,
+    )
+    cb.raise_for_status()
+    batch_id = cb.json()["batch_id"]
+    logger.info("[Batch] submitted %d requests as batch %s ('%s') — polling "
+                "(this can take a while; xAI's guidance is up to ~24h)…",
+                len(prompts), batch_id, batch_name)
+
+    t0 = time.time()
+    while True:
+        st = requests.get(f"{_XAI_BATCH_BASE}/batches/{batch_id}", headers=headers, timeout=30)
+        st.raise_for_status()
+        state = st.json().get("state", {}) or {}
+        pending = state.get("num_pending", 0)
+        total = state.get("num_requests", len(prompts))
+        done = state.get("num_success", 0) + state.get("num_error", 0)
+        logger.info("[Batch] %s: %d/%d complete (%d pending)", batch_id, done, total, pending)
+        if total > 0 and pending == 0:
+            break
+        if time.time() - t0 > timeout_s:
+            logger.warning("[Batch] %s timed out after %.0fs with %d/%d still pending — "
+                           "returning what's finished so far.", batch_id, timeout_s, pending, total)
+            break
+        time.sleep(poll_interval)
+
+    out = [""] * len(prompts)
+    pagination_token = None
+    while True:
+        params = {"limit": 100}
+        if pagination_token:
+            params["pagination_token"] = pagination_token
+        rs = requests.get(f"{_XAI_BATCH_BASE}/batches/{batch_id}/results",
+                          headers=headers, params=params, timeout=60)
+        rs.raise_for_status()
+        page = rs.json()
+        for r in page.get("results", []):
+            rid = r.get("batch_request_id") or r.get("custom_id") or ""
+            try:
+                i = int(str(rid).split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if not (0 <= i < len(out)):
+                continue
+            resp = ((r.get("batch_result") or {}).get("response")
+                    or r.get("response") or {})
+            comp = resp.get("chat_get_completion") or resp
+            choices = comp.get("choices") or []
+            if choices:
+                out[i] = (choices[0].get("message", {}) or {}).get("content", "") or ""
+        pagination_token = page.get("pagination_token")
+        if not pagination_token:
+            break
+    n_empty = sum(1 for o in out if not o)
+    if n_empty:
+        logger.warning("[Batch] %s: %d/%d requests came back empty/failed.",
+                       batch_id, n_empty, len(out))
+    return out
+
+
 def review_and_revise_image_prompts(
     shots: List["Shot"],
     visual_treatment: Dict[str, str],
@@ -4717,26 +5120,64 @@ def review_and_revise_image_prompts(
     Modifies shot.image_prompt in-place. Uses cached_prefix so the stable
     art-director instruction block is served from Grok's prefix cache after
     the first batch call, making subsequent batch calls significantly cheaper.
+
+    Batches are independent of each other — each only reads the GLOBAL shots
+    list (already fully authored by the time this pass runs) for adjacent
+    context, and only writes to shots inside its own slice. Two ways to run
+    them, both exploiting that independence:
+      • default: a small thread pool fires them concurrently (N * 15-20s of
+        wall-clock collapses to roughly one batch's worth).
+      • pcfg.prompt_review_use_batch_api=True: ALL batches are submitted as
+        ONE xAI Batch API job and this call blocks until it's done. Slower
+        wall-clock (batch jobs are "typically within 24h", not seconds) but
+        a flat cost discount on every token — including already-cached ones
+        — so it's a straight cost win whenever you can afford to wait. See
+        _grok_batch_map.
     """
     if not _HAS_NG or not getattr(pcfg, "prompt_review", True):
         return
 
     batch_size = max(2, int(getattr(pcfg, "prompt_review_batch_size", 6)))
-    shots_with_prompts = [s for s in shots if s.image_prompt]
-    if not shots_with_prompts:
+    all_with_prompts = [s for s in shots if s.image_prompt]
+    if not all_with_prompts:
         return
+
+    # Review scope. "flagged" (default) runs the critic ONLY on shots that
+    # failed the free deterministic QC gate — typically a small minority —
+    # rather than paying a model to re-read every prompt to rediscover
+    # problems code can already find. The authoring pass's coach block is
+    # what's meant to prevent those problems in the first place; this is the
+    # verification step behind it, not a replacement for it.
+    # Set prompt_review_scope="all" to restore reviewing every shot (slower,
+    # more expensive, but also lets the critic catch the one thing QC cannot:
+    # whether a visual genuinely serves its narrative beat).
+    scope = str(getattr(pcfg, "prompt_review_scope", "flagged")).lower()
+    if scope == "all":
+        shots_with_prompts = all_with_prompts
+    else:
+        shots_with_prompts = _qc_flag_prompts(all_with_prompts)
+        if not shots_with_prompts:
+            logger.info(
+                "[PromptReview] Deterministic QC found no defective prompts in "
+                "%d shots — skipping the critic pass entirely (0 LLM calls).",
+                len(all_with_prompts),
+            )
+            return
+        logger.info(
+            "[PromptReview] Deterministic QC flagged %d of %d prompts for "
+            "repair; reviewing only those.",
+            len(shots_with_prompts), len(all_with_prompts),
+        )
 
     treatment_block = _format_visual_treatment_for_prompt(visual_treatment)
     n_shots = len(shots)
-    n_revised = 0
+    starts = list(range(0, len(shots_with_prompts), batch_size))
 
-    for start in range(0, len(shots_with_prompts), batch_size):
+    def _build_batch_prompt(start: int) -> Tuple[List["Shot"], str]:
+        """Build the (batch, full-prompt-with-cached-prefix) for one batch."""
         batch = shots_with_prompts[start:start + batch_size]
-
-        # Build the variable part: per-batch shot list with adjacent context
         shot_blocks = []
         for k, sh in enumerate(batch):
-            # Include the previous shot's prompt as adjacent context
             prev_prompt = ""
             if sh.index > 0:
                 prev = next(
@@ -4753,13 +5194,15 @@ def review_and_revise_image_prompts(
                 f"(intensity {arc_phase.get('intensity', '?')})"
                 if arc_phase else "arc: unknown"
             )
+            qc = getattr(sh, "_qc_reasons", None)
+            qc_line = f"  DETECTED PROBLEMS (fix these specifically): {', '.join(qc)}\n" if qc else ""
             shot_blocks.append(
                 f"[{k}] shot_index={sh.index} | {arc_info}\n"
                 f"  narrative: {(sh.description or sh.setting or '—')[:120]}\n"
                 f"  prev_shot_prompt_summary: {prev_prompt[:120] or '—'}\n"
+                f"{qc_line}"
                 f"  current_prompt:\n{sh.image_prompt}"
             )
-
         variable_block = (
             f"FILM VISUAL TREATMENT:\n{treatment_block or '(none)'}\n\n"
             "SHOTS TO REVIEW:\n" + "\n\n".join(shot_blocks) + "\n\n"
@@ -4769,33 +5212,89 @@ def review_and_revise_image_prompts(
             '[{"i": 0, "verdict": "pass"}, '
             '{"i": 1, "verdict": "revise", "revised_prompt": "full corrected prompt here"}]'
         )
+        # cached_prefix is normally merged in by get_openai_prompt_response;
+        # the batch path calls the API directly, so merge it here ourselves.
+        return batch, _PROMPT_REVIEW_PREFIX + "\n\n" + variable_block
 
+    def _apply_result(batch: List["Shot"], raw: str) -> int:
+        """Parse one batch's raw response and apply any revisions. Returns count."""
         try:
-            raw = ng.get_openai_prompt_response(
-                variable_block,
-                temperature=0.4,
-                openai_model=getattr(ng, "openai_model_large", None),
-                use_grok=getattr(ng, "USE_GROK", True),
-                cached_prefix=_PROMPT_REVIEW_PREFIX,
-            )
             results = ng.parse_json_response(raw)
-            if not isinstance(results, list):
-                continue
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                verdict = str(item.get("verdict", "pass")).lower()
-                if verdict != "revise":
-                    continue
-                idx = item.get("i")
-                if idx is None or not isinstance(idx, int) or idx >= len(batch):
-                    continue
-                new_prompt = str(item.get("revised_prompt", "")).strip()
-                if new_prompt and new_prompt != batch[idx].image_prompt:
-                    batch[idx].image_prompt = new_prompt
-                    n_revised += 1
         except Exception as e:
-            logger.debug("[PromptReview] Batch %d failed (%s).", start, e)
+            logger.debug("[PromptReview] Batch parse failed (%s).", e)
+            return 0
+        if not isinstance(results, list):
+            return 0
+        revised = 0
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("verdict", "pass")).lower() != "revise":
+                continue
+            idx = item.get("i")
+            if idx is None or not isinstance(idx, int) or idx >= len(batch):
+                continue
+            new_prompt = str(item.get("revised_prompt", "")).strip()
+            if new_prompt and new_prompt != batch[idx].image_prompt:
+                batch[idx].image_prompt = new_prompt
+                revised += 1
+        return revised
+
+    n_revised = 0
+    if getattr(pcfg, "prompt_review_use_batch_api", False):
+        pairs = [_build_batch_prompt(s) for s in starts]
+        try:
+            raws = _grok_batch_map(
+                [full_prompt for _, full_prompt in pairs],
+                model=getattr(ng, "grok_fast_nonreasoning_model", "grok-4.3"),
+                temperature=0.4,
+                batch_name="prompt_review",
+            )
+        except Exception as e:
+            logger.error(
+                "[PromptReview] Batch API submission failed (%s) — falling back "
+                "to the synchronous thread-pool path for this run.", e,
+            )
+            raws = None
+        if raws is not None:
+            for (batch, _), raw in zip(pairs, raws):
+                n_revised += _apply_result(batch, raw)
+        else:
+            for batch, full_prompt in pairs:
+                try:
+                    raw = ng.get_openai_prompt_response(
+                        full_prompt, temperature=0.4,
+                        openai_model=getattr(ng, "openai_model_large", None),
+                        use_grok=getattr(ng, "USE_GROK", True),
+                    )
+                    n_revised += _apply_result(batch, raw)
+                except Exception as e:
+                    logger.debug("[PromptReview] Fallback batch failed (%s).", e)
+    else:
+        def _review_one_batch(start: int) -> int:
+            batch, full_prompt = _build_batch_prompt(start)
+            # cached_prefix already merged into full_prompt above; pass "" here
+            # so get_openai_prompt_response doesn't merge it a second time.
+            try:
+                raw = ng.get_openai_prompt_response(
+                    full_prompt, temperature=0.4,
+                    openai_model=getattr(ng, "openai_model_large", None),
+                    use_grok=getattr(ng, "USE_GROK", True),
+                )
+                return _apply_result(batch, raw)
+            except Exception as e:
+                logger.debug("[PromptReview] Batch %d failed (%s).", start, e)
+                return 0
+
+        max_workers = max(1, min(int(getattr(pcfg, "prompt_review_max_workers", 5)), len(starts)))
+        if max_workers <= 1 or len(starts) <= 1:
+            for start in starts:
+                n_revised += _review_one_batch(start)
+        else:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for revised in pool.map(_review_one_batch, starts):
+                    n_revised += revised
 
     if n_revised:
         logger.info("[PromptReview] Revised %d of %d prompts.", n_revised, len(shots_with_prompts))
@@ -4821,9 +5320,19 @@ def build_shot_continuity_summaries(
     shots: List["Shot"],
     pcfg: "ProjectConfig",
 ) -> None:
-    """Generate a one-line continuity summary for each shot and store it on
-    shot._prev_summary (a transient attribute set here and read by
-    generate_image_prompts when shot_continuity_context is True).
+    """UNUSED as of the animate() pipeline — kept for reference/manual use only.
+
+    Originally: generate a one-line continuity summary for each shot and store
+    it on shot._prev_summary, for generate_image_prompts to read back. The
+    pipeline called this AFTER generate_image_prompts, though, so the attribute
+    it sets was never populated in time — every prompt was authored with an
+    empty continuity cue, and this function's ~20-30 extra LLM calls (a whole
+    multi-minute pass) produced summaries nothing downstream ever read.
+    generate_image_prompts now threads its own continuity cue forward
+    internally (batch N's last shot's "summary" field seeds batch N+1's cue),
+    for free, using data it already returns — see last_summary in that
+    function. This function is left in place only in case something outside
+    the standard pipeline still wants a full independent continuity pass.
 
     Batches the summaries in one LLM call per batch. Uses cached_prefix for
     Grok prefix-cache efficiency across batches.
@@ -4967,12 +5476,30 @@ _IMG_EXPRESSIVE_GUIDANCE = (
 )
 
 
+# Fallback channel for the image-prompt Batch API flag.
+#
+# Add-ons monkeypatch generate_image_prompts with wrappers whose signatures
+# predate this kwarg (e.g. ltx23_prompt_guide.apply). Such a wrapper delegates
+# to the original WITHOUT use_batch_api, so passing it as a kwarg from plan()
+# can never reach the real function no matter what the caller sets — the
+# wrapper silently drops it on the way through.
+#
+# A module-level override sidesteps that entirely: the wrapper doesn't need to
+# know the flag exists, because the real function reads it from here when the
+# kwarg wasn't explicitly supplied. Works with any wrapper that ultimately
+# delegates to the original (the overwhelmingly common pattern), with no edit
+# to the add-on. plan() sets it around the call and always restores it, so it
+# never leaks into an unrelated later call.
+_IMAGE_PROMPTS_BATCH_OVERRIDE: Optional[bool] = None
+
+
 def generate_image_prompts(shots: List[Shot], characters: List["Character"],
                            theme: str, batch_size: int = 5,
                            cinematic: bool = True, expressive: bool = True,
                            visual_treatment: Optional[Dict[str, str]] = None,
                            arc_map: Optional[List[Dict]] = None,
-                           use_continuity_context: bool = True) -> None:
+                           use_continuity_context: bool = True,
+                           use_batch_api: Optional[bool] = None) -> None:
     """LLM-author a structured KLEIN2 prompt per shot, in the labelled format.
 
     Batches several shots per call for speed/cost. Injects each on-screen
@@ -5075,12 +5602,88 @@ def generate_image_prompts(shots: List[Shot], characters: List["Character"],
         "Keep named characters' gender/build/appearance EXACTLY as given. "
         "STYLE CONSISTENCY: reuse the global style wording verbatim in every 'style' field. "
         "Be specific, vivid, and surprising.\n\n"
+        # ── Coach block ──────────────────────────────────────────────────────
+        # These are the exact criteria an art-director critic pass used to
+        # apply AFTER the fact, restated as requirements to satisfy BEFORE
+        # emitting. Stating the standard up front is cheaper than paying a
+        # second model call to find violations of an unstated standard — and
+        # it lives inside the cached prefix, so its length costs ~nothing
+        # after the first call of a run. It does NOT replace verification:
+        # _ensure_prompt_richness + _qc_flag_prompts still check the
+        # mechanically-checkable parts of this list afterwards, and anything
+        # that fails is sent back for a targeted repair.
+        "QUALITY BAR — you are the art director, not a first-draft writer. "
+        "Every prompt you emit must already satisfy all four of these; do not "
+        "rely on anyone downstream to fix them:\n"
+        "1. STORY SERVICE: the visual must serve THIS specific narrative beat. "
+        "If your Environment/Action would fit equally well in any other shot of "
+        "any other story with the same mood word, it is too generic — rewrite it "
+        "around what is actually happening and at stake in this moment.\n"
+        "2. VISUAL VARIETY: you are shown the previous shot's framing, mood and "
+        "light. Do not repeat its framing AND its light AND its colour "
+        "temperature. Change at least one deliberately, and if the previous shot "
+        "shares this shot's location, change the framing so the cut reads as a "
+        "new angle on a known space rather than a duplicate.\n"
+        "3. LOCK CONSISTENCY: never contradict a character's given "
+        "gender/build/appearance, the stated setting, or the film's visual "
+        "treatment. When in doubt, restate the lock verbatim rather than "
+        "paraphrasing it.\n"
+        "4. IMAGINATIVE DEPTH — NO PLAIN SHOTS: a bare backdrop, a location name "
+        "with no concrete detail, an empty Objects field, or a lone figure "
+        "against nothing is a FAILED prompt even if everything else is correct. "
+        "Objects must always name specific, tangible props that belong to this "
+        "world and this moment.\n\n"
+        "Before you emit each shot, silently re-read it against those four "
+        "points and fix it yourself. Emit only the corrected version.\n\n"
         + (_IMG_EXPRESSIVE_GUIDANCE if expressive else "")
         + "FORMAT (study these examples):\n" + _STRUCT_FEWSHOT
     )
 
-    for start in range(0, len(shots), batch_size):
-        batch = shots[start:start + batch_size]
+    def _prev_shot_brief(sh: Shot) -> str:
+        """Deterministic continuity cue: what the PREVIOUS shot actually is.
+
+        Built purely from shot data known before any LLM call — no dependency
+        on a previous call's output. That's what makes the whole pass
+        submittable as one Batch API job (every request independent), but it's
+        also simply a better cue than the old rolling LLM summary was:
+          • ground truth, not a model's paraphrase of its own earlier output
+            (no drift, no compounding error down a 248-shot film);
+          • available for EVERY shot, not just the first shot of each batch —
+            the old carry-forward could only bridge batch seams;
+          • deterministic, so a re-run reproduces identical prompts.
+        Shots inside one batch still also see each other directly in the same
+        call, which remains the strongest signal; this adds the explicit
+        cross-cut cue on top.
+        """
+        if sh.index <= 0:
+            return ""
+        prev = next((s for s in shots if s.index == sh.index - 1), None)
+        if prev is None:
+            return ""
+        bits = []
+        if prev.setting:
+            bits.append(f"setting {prev.setting}")
+        if prev.composition:
+            bits.append(f"framed {prev.composition}")
+        if prev.mood:
+            bits.append(f"mood {prev.mood}")
+        if cinematic:
+            pc = _cinematic_cues(prev)
+            if pc.get("lighting"):
+                bits.append(f"lit {pc['lighting']}")
+        same_place = bool(prev.setting and sh.setting
+                          and prev.setting.strip().lower() == sh.setting.strip().lower())
+        if not bits:
+            return ""
+        tail = (" — SAME location as this shot: keep the established geography, "
+                "light direction and colour consistent, and change the framing "
+                "so the cut doesn't read as a repeat."
+                if same_place else
+                " — DIFFERENT location: make this cut visually distinct in "
+                "framing and light while staying inside the film's palette.")
+        return "; ".join(bits) + tail
+
+    def _build_variable_part(batch: List[Shot]) -> str:
         blocks = []
         for k, sh in enumerate(batch):
             people = "; ".join(char_brief(n) for n in sh.characters_in_frame[:3]) or "(none)"
@@ -5094,9 +5697,8 @@ def generate_image_prompts(shots: List[Shot], characters: List["Character"],
             arc_line = f"\n    narrative arc: {_arc_info(sh)}" if expressive else ""
             moment = _story_moment(sh) if expressive else ""
             moment_line = f"\n    story moment: {moment}" if moment else ""
-            # Shot-to-shot continuity: include the previous shot's summary when available
-            prev_summary = getattr(sh, "_prev_summary", "") if use_continuity_context else ""
-            continuity_line = f"\n    prev shot visual summary: {prev_summary}" if prev_summary else ""
+            prev_brief = _prev_shot_brief(sh) if use_continuity_context else ""
+            continuity_line = f"\n    previous shot was: {prev_brief}" if prev_brief else ""
             visual_desc = _visual_safe_description(sh)
             blocks.append(
                 f"[{k}] visual description: {visual_desc or '—'}\n"
@@ -5104,9 +5706,7 @@ def generate_image_prompts(shots: List[Shot], characters: List["Character"],
                 f"    setting: {sh.setting or '—'} | shot: {sh.composition} | mood: {sh.mood or '—'}"
                 f"{cue}{expr_line}{arc_line}{moment_line}{continuity_line}"
             )
-
-        # Variable part per batch: treatment + style + shots
-        variable_part = (
+        return (
             f"\n\nFILM VISUAL TREATMENT (honour in every shot):\n{treatment_block}\n\n"
             f"GLOBAL STYLE to reuse verbatim in every 'style' field: {theme or 'cinematic, filmic'}\n\n"
             "SHOTS:\n" + "\n".join(blocks) + "\n\n"
@@ -5116,54 +5716,8 @@ def generate_image_prompts(shots: List[Shot], characters: List["Character"],
             '"camera":"...","style":"..."}]  '
             "Omit a field by leaving it an empty string. No prose outside the JSON."
         )
-        data = None
-        if _HAS_NG:
-            # Up to two attempts: a transient network hiccup or a single
-            # malformed-JSON response used to silently degrade the WHOLE
-            # batch to the plain emergency fallback (see build_image_prompt).
-            # One retry with a stricter reminder recovers the large majority
-            # of those cases before we ever fall back.
-            for attempt in range(2):
-                try:
-                    # cached_prefix holds the stable instruction scaffold
-                    # (identical across all batches); variable_part holds only
-                    # what changes per batch. Grok serves the prefix from
-                    # cache after the first call.
-                    _part = variable_part
-                    if attempt == 1:
-                        _part += (
-                            "\n\nREMINDER: return ONLY the JSON array, no prose, "
-                            "no markdown fences, one object per shot index."
-                        )
-                    raw = ng.get_openai_prompt_response(
-                        _part,
-                        temperature=0.88 if attempt == 0 else 0.6,
-                        openai_model=getattr(ng, "openai_model_large", None),
-                        use_grok=getattr(ng, "USE_GROK", True),
-                        cached_prefix=_cached_prefix,
-                    )
-                    parsed = ng.parse_json_response(raw)
-                    if isinstance(parsed, dict):
-                        parsed = parsed.get("shots") or parsed.get("prompts") or []
-                    if isinstance(parsed, list) and parsed:
-                        data = parsed
-                        break
-                except Exception as e:
-                    if attempt == 0:
-                        logger.debug(
-                            "  image-prompt batch (shots %s) attempt 1 failed "
-                            "(%s) — retrying once.",
-                            [s.index for s in batch], e,
-                        )
-                    else:
-                        logger.warning(
-                            "  [PROMPTS] image-prompt batch (shots %s) failed "
-                            "after retry (%s) — these shots will use the "
-                            "plain emergency fallback builder. If this "
-                            "happens often, check API rate limits / JSON "
-                            "parsing for this model.",
-                            [s.index for s in batch], e,
-                        )
+
+    def _apply_batch(batch: List[Shot], data: Optional[list]) -> None:
         by_i = {int(o.get("i", -1)): o for o in (data or []) if isinstance(o, dict)}
         _fell_back = []
         for k, sh in enumerate(batch):
@@ -5180,6 +5734,114 @@ def generate_image_prompts(shots: List[Shot], characters: List["Character"],
                 "builder (no LLM-authored prompt available for these).",
                 _fell_back,
             )
+
+    def _parse(raw: str) -> Optional[list]:
+        parsed = ng.parse_json_response(raw)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("shots") or parsed.get("prompts") or []
+        return parsed if (isinstance(parsed, list) and parsed) else None
+
+    # Every batch's prompt is built up front. Crucially, NO batch depends on
+    # any other batch's OUTPUT any more — the continuity cue is derived
+    # deterministically from shot data (see _prev_shot_brief) rather than
+    # carried forward from the previous call's response — so the whole pass
+    # can be submitted as one asynchronous Batch API job.
+    batches = [shots[s:s + batch_size] for s in range(0, len(shots), batch_size)]
+    parts = [_build_variable_part(b) for b in batches]
+
+    # Tri-state resolution: an explicitly-passed kwarg always wins; None means
+    # "caller didn't say", in which case fall back to the module-level override
+    # (see _IMAGE_PROMPTS_BATCH_OVERRIDE) — which is how the flag reaches here
+    # when a monkeypatch wrapper sits in between and drops unknown kwargs.
+    _batch_flag = use_batch_api
+    if _batch_flag is None:
+        _batch_flag = _IMAGE_PROMPTS_BATCH_OVERRIDE
+    use_batch = bool(_batch_flag) and _HAS_NG and bool(batches)
+    if use_batch and use_batch_api is None:
+        logger.info("[PROMPTS] Batch API enabled via project config "
+                    "(image_prompts_use_batch_api).")
+    if use_batch:
+        try:
+            raws = _grok_batch_map(
+                [_cached_prefix + "\n\n" + p for p in parts],
+                model=getattr(ng, "grok_fast_nonreasoning_model", "grok-4.3"),
+                temperature=0.88,
+                batch_name="image_prompts",
+            )
+        except Exception as e:
+            logger.error(
+                "[PROMPTS] Batch API submission failed (%s) — falling back to "
+                "synchronous authoring for this run.", e,
+            )
+            use_batch = False
+        else:
+            n_empty = 0
+            for batch, raw in zip(batches, raws):
+                data = None
+                if raw:
+                    try:
+                        data = _parse(raw)
+                    except Exception as e:
+                        logger.debug("  [PROMPTS] batch parse failed (%s).", e)
+                if data is None:
+                    n_empty += 1
+                _apply_batch(batch, data)
+            if n_empty:
+                logger.warning(
+                    "  [PROMPTS] %d/%d batches came back empty or unparseable "
+                    "from the batch job; those shots used the fallback builder.",
+                    n_empty, len(batches),
+                )
+
+    if not use_batch:
+        for batch, variable_part in zip(batches, parts):
+            data = None
+            if _HAS_NG:
+                # Up to two attempts: a transient network hiccup or a single
+                # malformed-JSON response used to silently degrade the WHOLE
+                # batch to the plain emergency fallback (see build_image_prompt).
+                # One retry with a stricter reminder recovers the large majority
+                # of those cases before we ever fall back.
+                for attempt in range(2):
+                    try:
+                        # cached_prefix holds the stable instruction scaffold
+                        # (identical across all batches); variable_part holds only
+                        # what changes per batch. Grok serves the prefix from
+                        # cache after the first call.
+                        _part = variable_part
+                        if attempt == 1:
+                            _part += (
+                                "\n\nREMINDER: return ONLY the JSON array, no prose, "
+                                "no markdown fences, one object per shot index."
+                            )
+                        raw = ng.get_openai_prompt_response(
+                            _part,
+                            temperature=0.88 if attempt == 0 else 0.6,
+                            openai_model=getattr(ng, "openai_model_large", None),
+                            use_grok=getattr(ng, "USE_GROK", True),
+                            cached_prefix=_cached_prefix,
+                        )
+                        parsed = _parse(raw)
+                        if parsed:
+                            data = parsed
+                            break
+                    except Exception as e:
+                        if attempt == 0:
+                            logger.debug(
+                                "  image-prompt batch (shots %s) attempt 1 failed "
+                                "(%s) — retrying once.",
+                                [s.index for s in batch], e,
+                            )
+                        else:
+                            logger.warning(
+                                "  [PROMPTS] image-prompt batch (shots %s) failed "
+                                "after retry (%s) — these shots will use the "
+                                "plain emergency fallback builder. If this "
+                                "happens often, check API rate limits / JSON "
+                                "parsing for this model.",
+                                [s.index for s in batch], e,
+                            )
+            _apply_batch(batch, data)
     logger.info("[PROMPTS] structured image prompts ready for %d shots.", len(shots))
     _ensure_prompt_richness(shots, theme, visual_treatment)
 
@@ -5231,6 +5893,60 @@ def _replace_or_append_section(prompt: str, label: str, body: str) -> str:
     if pattern.search(prompt):
         return pattern.sub(f"{label}: {body}", prompt, count=1)
     return prompt.rstrip() + f"\n{label}: {body}"
+
+
+def _qc_flag_prompts(shots: List["Shot"]) -> List["Shot"]:
+    """Deterministic QC: return the shots whose prompts look genuinely
+    defective, so an LLM critic can be pointed at ONLY those.
+
+    Three of the four things the art-director critic pass checks are
+    mechanically checkable for free, and are checked here:
+      • IMAGINATIVE DEPTH — a thin/missing Environment or an empty Objects
+        field (the "plain backdrop, lone figure" failure). _ensure_prompt_
+        richness auto-repairs most of these first; anything still thin after
+        that repair is genuinely stuck and worth a model's attention.
+      • VISUAL VARIETY — adjacent shots whose Lighting AND Camera AND
+        Environment are effectively identical (the monotonous-cut failure).
+      • STRUCTURAL COMPLETENESS — a prompt missing Subject or Environment
+        entirely, which in practice means it came from the emergency
+        fallback builder rather than the authoring model.
+
+    The fourth check — STORY SERVICE, whether a visual genuinely serves its
+    narrative beat — is real judgement and is NOT checkable here; that one is
+    handled proactively in the authoring prompt's coach block, and is the
+    reason to keep a (much smaller) critic pass rather than delete it.
+    """
+    flagged: List["Shot"] = []
+    prev_sections: Optional[Dict[str, str]] = None
+    for sh in shots:
+        prompt = sh.image_prompt or ""
+        if not prompt.strip():
+            continue
+        sec = _prompt_sections(prompt)
+        reasons = []
+
+        if _is_environment_thin(sec.get("environment", "")):
+            reasons.append("thin environment")
+        if not sec.get("objects", "").strip():
+            reasons.append("no objects")
+        if not sec.get("subject", "").strip():
+            reasons.append("no subject")
+
+        if prev_sections is not None:
+            def _norm(t: str) -> str:
+                return " ".join((t or "").lower().split())
+            same = sum(
+                1 for key in ("lighting", "camera", "environment")
+                if _norm(sec.get(key, "")) and _norm(sec.get(key, "")) == _norm(prev_sections.get(key, ""))
+            )
+            if same >= 3:
+                reasons.append("identical to previous shot's lighting+camera+environment")
+
+        if reasons:
+            sh._qc_reasons = reasons          # transient; read by the critic pass
+            flagged.append(sh)
+        prev_sections = sec
+    return flagged
 
 
 def _ensure_prompt_richness(shots: List["Shot"], theme: str,
@@ -6170,8 +6886,8 @@ def _safe_image_generation_resolution(width: int, height: int, vcfg: "VideoConfi
     # identical pixel dimensions with no lossy rescaling.
     if getattr(vcfg, "prefer_ltx2", False):
         ltx_mult  = max(16, int(getattr(vcfg, "ltx2_resolution_multiple", 64)))
-        ltx_long  = int(getattr(vcfg, "ltx2_max_long",  960))
-        ltx_short = int(getattr(vcfg, "ltx2_max_short", 576))
+        ltx_long  = int(getattr(vcfg, "ltx2_max_long",  1280))
+        ltx_short = int(getattr(vcfg, "ltx2_max_short", 720))
         w = _round_to_multiple(width,  ltx_mult, "nearest")
         h = _round_to_multiple(height, ltx_mult, "nearest")
         w, h = _cap_resolution_for_4090(w, h,
@@ -6596,7 +7312,23 @@ class BaseVideo:
         align = max(1, int(self.frame_align))
         if align <= 1:
             return raw
-        k = round((raw - 1) / align)
+        # Round UP (ceiling), never to nearest. round-to-nearest could return
+        # an aligned frame count BELOW the requested one (whenever the raw
+        # count sits in the lower half of an alignment step). For audio-
+        # driven engines (LTX-2 a2vid, whose harness slices the driving audio
+        # to this exact "actual" duration via _slice_audio in animate()),
+        # that shortfall silently truncates the TAIL of the audio the model
+        # is driven by — the model never renders motion/lip-sync for that
+        # last sliver of speech, and the final mux then freeze-pads the clip
+        # with the last frame while the untouched full audio keeps playing
+        # underneath it, producing a visible/audible desync concentrated at
+        # the end of shots. Rounding up guarantees the aligned duration is
+        # always >= the requested one, so the audio slice always covers the
+        # full requested speech; any tiny overrun is harmless (a2vid's own
+        # truncate-to-video-length logic and the _pad_audio_to_stereo buffer
+        # already handle audio >= video safely — it's audio < video that was
+        # the unhandled case).
+        k = math.ceil((raw - 1) / align)
         return max(align + 1, align * k + 1)
 
     def _num_frames(self, shot: Shot) -> int:
@@ -6637,6 +7369,34 @@ class BaseVideo:
             if audio_dur > 0 and audio_dur > shot.duration + 0.01:
                 shot.duration = audio_dur
 
+            # Audio-driven, frame-aligned engines (LTX-2: 8k+1 frames) need a
+            # render length that lands exactly on the alignment grid. Rather
+            # than asking for a grid-snapped frame count that's LONGER than
+            # the real dialogue and then discarding/cropping the overshoot at
+            # mux time, extend the CANONICAL audio itself with trailing
+            # silence out to that grid duration. Everything downstream
+            # (segment slicing, cursor math, the final per-shot mux) then
+            # already agrees on one exact, grid-aligned length — no crop, no
+            # freeze-pad, no generated frames thrown away.
+            if (self.supports_audio_drive and self.frame_align > 1
+                    and audio_dur > 0):
+                aligned_secs = self._aligned_frames_for(audio_dur) / float(self.vcfg.fps)
+                if aligned_secs > audio_dur + 0.005:
+                    padded = str(Path(shot.audio_path).with_name(
+                        Path(shot.audio_path).stem + f"_{self.name}grid.wav"))
+                    if not (Path(padded).exists()
+                            and abs(_wav_duration(padded) - aligned_secs) <= 0.005):
+                        _pad_wav_to_duration(shot.audio_path, aligned_secs, padded)
+                    if Path(padded).exists():
+                        logger.info(
+                            "  shot %04d  [%s] padded audio %.3fs -> %.3fs to land "
+                            "on the %dk+1-frame grid @%gfps",
+                            shot.index, self.name, audio_dur, aligned_secs,
+                            self.frame_align, self.vcfg.fps)
+                        shot.audio_path = padded
+                        audio_dur = aligned_secs
+                        shot.duration = aligned_secs
+
         # Audio-driven engines (Wan-S2V, LTX-2's a2vid path) generate motion
         # AND lip-sync directly from the waveform — the render length must
         # come EXACTLY from that audio's duration. No flooring against an
@@ -6644,13 +7404,16 @@ class BaseVideo:
         # min_audio_padding safety buffer: that buffer exists so a clip is
         # never shorter than its (separately-muxed) audio on NON-audio-driven
         # engines, but here it would just ask the model to render seconds the
-        # audio doesn't cover — extra length that then has to be silently
-        # trimmed back off at the per-shot mux step, which is exactly the
-        # kind of post-hoc audio/video reconciliation this is meant to avoid.
-        # frames_for()/_aligned_frames_for() turn this exact duration into
-        # the engine's frame count (duration*fps, snapped to that engine's
-        # k*align+1 constraint) — the audio itself is not touched again after
-        # this point; it is muxed into the final clip byte-for-byte.
+        # audio doesn't cover — extra length that would then have to be
+        # silently trimmed back off (or the video freeze-padded to catch up)
+        # at the per-shot mux step, which is exactly the kind of post-hoc
+        # audio/video reconciliation this is meant to avoid. For engines with
+        # frame_align <= 1 that reconciliation is unnecessary in the first
+        # place (frames_for()'s own sub-frame rounding is <1/fps and never
+        # touches the file); for frame_align > 1 engines it's made
+        # unnecessary by the grid-padding above, which is the ONE place the
+        # audio is touched — after this point it is muxed into the final
+        # clip byte-for-byte, already the exact length the video will be.
         if self.supports_audio_drive and has_audio and audio_dur > 0:
             return audio_dur
 
@@ -8143,8 +8906,8 @@ class LTX2Video(BaseVideo):
         # apply_gpu_preset) set ltx2_max_long/short AND vcfg.width/height to
         # the exact target resolution, so this cap is a no-op in the normal case
         # and only activates if someone passes an oversized vcfg manually.
-        max_long  = int(getattr(self.vcfg, "ltx2_max_long",  960))
-        max_short = int(getattr(self.vcfg, "ltx2_max_short", 576))
+        max_long  = int(getattr(self.vcfg, "ltx2_max_long",  1280))
+        max_short = int(getattr(self.vcfg, "ltx2_max_short", 720))
         w, h = _cap_resolution_for_4090(w, h, max_long=max_long,
                                         max_short=max_short, multiple=mult)
         return w, h
@@ -8595,15 +9358,15 @@ def apply_gpu_preset(
         # width/height are set here so every downstream path (image generation,
         # LTX2._resolution, compose, log messages) all agree on the same dims.
         "3090": dict(
-            width                   = 960,
-            height                  = 576,
-            ltx2_max_long           = 960,
-            ltx2_max_short          = 576,
+            width                   = 1280,
+            height                  = 720,
+            ltx2_max_long           = 1280,
+            ltx2_max_short          = 720,
             ltx2_use_upsampler      = True,  # 960×576 is the final output resolution
             ltx2_quantization       = "fp8-cast",
             ltx2_offload_mode       = "cpu",
             ltx2_segment_seconds    = 4.0,   # shorter segments → less VRAM per call
-            image_max_long_side     = 960,
+            image_max_long_side     = 1280,
             high_vram_threshold_gb  = 20.0,  # 3090 has 24 GB; stay well under
             try_sage_attention      = True,
             use_fp8                 = True,
@@ -8720,8 +9483,8 @@ def notebook_safe_4090_video_config(
     lipsync_unet_config: str = "auto",
     lipsync_python_exe: str = "",
     lipsync_extra_args: str = "--inference_steps 25 --guidance_scale 1.5",
-    width: int = 960,
-    height: int = 544,
+    width: int = 1280,
+    height: int = 720,
     fps: int = 24,
     fallback_engine: str = "wan_i2v",
     disable_framepack: bool = False,
@@ -8782,8 +9545,8 @@ def notebook_safe_4090_latentsync16_video_config(
     lipsync_checkpoint: str = "",
     lipsync_python_exe: str = "",
     lipsync_extra_args: str = "--inference_steps 25 --guidance_scale 1.5",
-    width: int = 960,
-    height: int = 544,
+    width: int = 1280,
+    height: int = 720,
     fps: int = 24,
     fallback_engine: str = "wan_i2v",
     disable_framepack: bool = False,
@@ -9206,6 +9969,25 @@ def _slice_audio(audio_path: str, start: float, dur: float, out_wav: str) -> Opt
     except Exception as e:
         logger.warning("  audio slice failed: %s", e)
         return None
+
+
+def _pad_wav_to_duration(src: str, seconds: float, out: str) -> str:
+    """Pad `src` with trailing silence out to an exact target duration,
+    preserving its original sample rate/channel layout.
+
+    Used to grow a shot's CANONICAL audio (the file everything else in the
+    harness treats as ground truth — segment slicing, final mux, duration
+    bookkeeping) so it already lands exactly on an audio-driven engine's
+    frame-alignment grid, instead of letting the video overshoot the audio
+    and relying on a later crop/freeze-pad to reconcile the two. See
+    BaseVideo._ensure_grid_aligned_audio.
+    """
+    try:
+        _run_ffmpeg(["-i", src, "-af", "apad", "-t", f"{seconds:.3f}", out])
+        return out if Path(out).exists() else src
+    except Exception as e:
+        logger.warning("  audio grid-pad failed: %s", e)
+        return src
 
 
 def _pad_audio_to_stereo(src: str, seconds: float, out: str) -> str:
@@ -9711,19 +10493,104 @@ def write_sync_report(shots: List[Shot], pcfg: ProjectConfig, vcfg: VideoConfig,
     return json_path
 
 
-def _concat_copy(paths: List[str], out_path: str) -> str:
-    """Loss-less concat of stream-compatible clips (the fast, hard-cut path)."""
+def _concat_copy_batch(paths: List[str], out_path: str) -> str:
+    """Single ffmpeg filter-concat pass over <= a few dozen clips.
+
+    This is the actual frame/sample-accurate join: every input is opened as
+    a full decoder, walked frame-by-frame and sample-by-sample through the
+    concat FILTER, then re-encoded. See ``_concat_copy`` for why this exists
+    instead of the lossless-looking ``-f concat -safe 0 -c copy`` demuxer
+    path (it avoids AAC encoder priming-delay drift accumulating per join).
+    This helper is intentionally kept single-level — batching/parallelism
+    lives in ``_concat_copy`` — so it should only ever be called with a
+    bounded number of paths.
+    """
     if len(paths) == 1:
         shutil.copy(paths[0], out_path)
         return out_path
-    lst = Path(out_path).with_suffix(".concat.txt")
-    lst.write_text("".join(f"file '{os.path.abspath(p)}'\n" for p in paths))
-    _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", out_path])
-    try:
-        lst.unlink()
-    except OSError:
-        pass
+    n = len(paths)
+    inputs: List[str] = []
+    for p in paths:
+        inputs += ["-i", p]
+    fps = _probe_fps(paths[0]) or 30.0
+    fc = ("".join(f"[{i}:v:0][{i}:a:0]" for i in range(n)) +
+          f"concat=n={n}:v=1:a=1[cv][ca]")
+    _run_ffmpeg([
+        *inputs,
+        "-filter_complex", fc,
+        "-map", "[cv]", "-map", "[ca]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", f"{fps:.6f}",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+        out_path,
+    ])
     return out_path
+
+
+def _concat_copy(paths: List[str], out_path: str, batch_size: int = 40,
+                  _tmp_root: Optional[Path] = None, _depth: int = 0) -> str:
+    """Frame/sample-accurate concat of already-normalized, stream-compatible clips.
+
+    This used to shell out to ffmpeg's ``-f concat -safe 0 -c copy`` (the
+    concat DEMUXER with stream copy). That's lossless for the video track,
+    but every AAC-encoded file carries a few dozen milliseconds of encoder
+    "priming" delay (silence the encoder needs before its first real sample)
+    that a normal player hides via the file's edit list (the mp4 ``elst``
+    atom). The concat demuxer does not read edit lists — it just appends raw
+    packets — so that hidden priming silence becomes audible extra delay at
+    the start of every clip after the first. Joining N clips this way stacks
+    up roughly N x that delay: audio that matches perfectly in each
+    individual clip drifts further behind (or ahead of) the video with every
+    join, which is exactly the "fine alone, delayed once assembled, and it
+    gets worse through the film" symptom this fixes.
+
+    Decoding and re-encoding through the concat FILTER instead walks every
+    frame and sample explicitly, so there's no edit list to lose and no
+    per-clip delay can accumulate. This changes nothing about the audio's
+    content, levels, or timing — only how the files are physically joined.
+
+    A single ffmpeg call opens every path in ``paths`` as a simultaneous
+    decoder for the whole filtergraph's lifetime, so joining hundreds of
+    clips this way in one shot means hundreds of open decoders and their
+    buffers all live in memory at once — that's what drives the slowdown
+    (and can drive an OOM crash) once the clip count gets into the hundreds.
+    Above ``batch_size`` clips, this instead does a tree reduction: clips
+    are joined in small batches, the batch outputs are joined the same way
+    recursively, so no single ffmpeg invocation ever has more than
+    ``batch_size`` decoders open. Batches are independent, so they run
+    across a small thread pool to use multiple cores instead of just one.
+    """
+    if len(paths) == 1:
+        shutil.copy(paths[0], out_path)
+        return out_path
+    if len(paths) <= batch_size:
+        return _concat_copy_batch(paths, out_path)
+
+    import tempfile
+    import concurrent.futures
+
+    own_tmp = _tmp_root is None
+    tmp_root = _tmp_root or Path(tempfile.mkdtemp(prefix="concat_tree_"))
+    try:
+        batches = [paths[i:i + batch_size] for i in range(0, len(paths), batch_size)]
+        batch_outs = [str(tmp_root / f"L{_depth}_{i:04d}.mp4") for i in range(len(batches))]
+
+        max_workers = max(1, min(len(batches), (os.cpu_count() or 4)))
+        logger.info("[CONCAT] %d clips \u2192 %d batch(es) of <=%d at depth %d (%d worker(s))",
+                    len(paths), len(batches), batch_size, _depth, max_workers)
+        if max_workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(_concat_copy, b, o, batch_size, tmp_root, _depth + 1)
+                           for b, o in zip(batches, batch_outs)]
+                for f in futures:
+                    f.result()
+        else:
+            for b, o in zip(batches, batch_outs):
+                _concat_copy(b, o, batch_size, tmp_root, _depth + 1)
+
+        return _concat_copy(batch_outs, out_path, batch_size, tmp_root, _depth + 1)
+    finally:
+        if own_tmp:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 def _group_scenes(ordered: List[Shot], norm_paths: List[str]) -> List[List[str]]:
@@ -9777,6 +10644,7 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
     """
     style = (getattr(vcfg, "scene_transition", "none") or "none").lower()
     transition = _XFADE_TRANSITION.get(style)
+    bs = max(1, int(getattr(vcfg, "concat_batch_size", 40)))
 
     # First collapse each scene to a single clip (hard cuts within the scene).
     scene_dir = Path(out_path).parent / "_scenes"
@@ -9784,12 +10652,12 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
     scene_paths: List[str] = []
     for si, clips in enumerate(scene_clips):
         sp = str(scene_dir / f"scene{si:03d}.mp4")
-        _concat_copy(clips, sp)
+        _concat_copy(clips, sp, batch_size=bs)
         scene_paths.append(sp)
 
     # Nothing to transition between (one scene, or transitions disabled).
     if transition is None or len(scene_paths) < 2:
-        _concat_copy(scene_paths, out_path)
+        _concat_copy(scene_paths, out_path, batch_size=bs)
         return out_path
 
     fps = int(vcfg.fps)
@@ -9808,7 +10676,7 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
 
     # If every usable boundary collapsed to a hard cut, skip the filtergraph.
     if not any(d > 0 for d in Ds):
-        _concat_copy(scene_paths, out_path)
+        _concat_copy(scene_paths, out_path, batch_size=bs)
         return out_path
 
     try:
@@ -9851,7 +10719,7 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
                     merged_paths.append(cur[0])
                 else:
                     m = str(scene_dir / f"merged{len(merged_paths):03d}.mp4")
-                    _concat_copy(cur, m)
+                    _concat_copy(cur, m, batch_size=bs)
                     merged_paths.append(m)
                 merged_durs.append(cur_dur)
                 chain_D.append(d)
@@ -9864,12 +10732,12 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
             merged_paths.append(cur[0])
         else:
             m = str(scene_dir / f"merged{len(merged_paths):03d}.mp4")
-            _concat_copy(cur, m)
+            _concat_copy(cur, m, batch_size=bs)
             merged_paths.append(m)
         merged_durs.append(cur_dur)
 
         if len(merged_paths) < 2:
-            _concat_copy(merged_paths, out_path)
+            _concat_copy(merged_paths, out_path, batch_size=bs)
             return out_path
 
         inputs: List[str] = []
@@ -9963,7 +10831,7 @@ def _assemble_with_transitions(scene_clips: List[List[str]], out_path: str,
     except Exception as e:
         logger.warning("[COMPOSE] scene-transition assembly failed (%s) — "
                        "falling back to hard cuts.", e)
-        _concat_copy(scene_paths, out_path)
+        _concat_copy(scene_paths, out_path, batch_size=bs)
         return out_path
 
 
@@ -9993,16 +10861,15 @@ def compose_film(shots: List[Shot], pcfg: ProjectConfig, vcfg: VideoConfig) -> O
         _normalize_for_concat(sh.video_path, np_out, W, H, fps, prefer_interp=True)
         norm_paths.append(np_out)
 
-    listfile = wd / "concat.txt"
-    listfile.write_text("".join(f"file '{os.path.abspath(p)}'\n" for p in norm_paths))
     concat_out = str(wd / f"{_slug(pcfg.title)}_concat.mp4")
     style = (getattr(vcfg, "scene_transition", "none") or "none").lower()
     if style == "none":
-        # Fast path: hard cuts everywhere (original behaviour).
-        _run_ffmpeg([
-            "-f", "concat", "-safe", "0", "-i", str(listfile),
-            "-c", "copy", concat_out,
-        ])
+        # Hard cuts everywhere — use the same frame/sample-accurate concat as
+        # every other path (see _concat_copy) instead of a raw stream-copy
+        # concat, which drifted audio out of sync via accumulated AAC
+        # encoder priming delay across many joined shots.
+        _concat_copy(norm_paths, concat_out,
+                     batch_size=max(1, int(getattr(vcfg, "concat_batch_size", 40))))
     else:
         # Group shots into scenes by setting and transition between scenes
         # (hard cuts still used within a scene). Silent boundary padding keeps
@@ -10502,17 +11369,22 @@ class _PlanCharacter:
         for a in ("dialect", "cadence", "vocabulary_level", "speech_pattern",
                   "voice_profile", "humor_style"):
             setattr(self, a, d.get(a, ""))
+        # role/occupation/nationality/age/etc — written to the plan by
+        # _char_dict specifically so voice re-casting on a resumed run has
+        # the same descriptive text to match against as the original run
+        # (see _character_voice_match_text / _VOICE_MATCH_EXTRA_FIELDS).
+        for a in _VOICE_MATCH_EXTRA_FIELDS:
+            setattr(self, a, d.get(a, ""))
         self.verbal_tics = d.get("verbal_tics", []) or []
         self.catchphrases = d.get("catchphrases", []) or []
 
 
 def _char_dict(ch, voice: "VoiceProfile") -> Dict[str, Any]:
-    return {
+    d = {
         "name": getattr(ch, "name", ""),
         "gender": getattr(ch, "gender", ""),
         "physical_build": getattr(ch, "physical_build", ""),
         "appearance": getattr(ch, "appearance", ""),
-        "role": getattr(ch, "role", ""),
         "voice": {
             "source": voice.source, "engine": "",            # "" = inherit project tts engine
             "ref_wav": voice.ref_wav, "ref_text": voice.params.get("ref_text", voice.ref_text),
@@ -10529,6 +11401,11 @@ def _char_dict(ch, voice: "VoiceProfile") -> Dict[str, Any]:
             "regenerate_baseline": voice.regenerate_baseline,
         },
     }
+    # See _PlanCharacter — everything written here under a plain (non-nested)
+    # key is read back on a resumed run.
+    for a in _VOICE_MATCH_EXTRA_FIELDS:
+        d[a] = getattr(ch, a, "")
+    return d
 
 
 def build_plan(anim: "StoryAnimator") -> Dict[str, Any]:
@@ -11188,24 +12065,54 @@ class StoryAnimator:
         # Cache on pcfg so review_and_revise_image_prompts can also access it
         self.p._arc_map_cache = _arc_map
 
-        # Image prompts — now receive visual treatment, arc map, and continuity flag
+        # Image prompts. Shot-to-shot continuity is threaded INSIDE this call:
+        # each shot's prompt carries a deterministic brief of what the previous
+        # shot actually is (setting/framing/mood/light — see _prev_shot_brief),
+        # derived from shot data rather than from a previous LLM call's output.
+        # That has two consequences: the cue reaches every shot instead of only
+        # batch seams, and — because no batch now depends on another batch's
+        # response — the whole pass can be submitted as one Batch API job.
+        # (Historically this was a separate build_shot_continuity_summaries()
+        # pass that ran AFTER this one, so the cue it produced was never
+        # actually read; those ~20-30 calls were pure waste.)
         logger.info("[PROMPTS] Authoring structured image prompts…")
-        generate_image_prompts(
-            self.shots, self.characters, self.p.theme,
-            cinematic=self.p.cinematic_prompts,
-            expressive=getattr(self.p, "expressive_detail", True),
-            visual_treatment=_visual_treatment,
-            arc_map=_arc_map,
-            use_continuity_context=getattr(self.p, "shot_continuity_context", True),
+        # This function is a common monkeypatch target for add-ons (e.g.
+        # ltx23_prompt_guide.apply). Two belt-and-braces measures so a wrapper
+        # with an older signature neither crashes the run nor silently
+        # disables the Batch API discount:
+        #   • the module-level override carries the batch flag to the real
+        #     function even when the wrapper drops the kwarg on the way
+        #     through (any wrapper that delegates to the original benefits,
+        #     with no edit to the add-on);
+        #   • _call_compat still passes the kwarg directly when the installed
+        #     callable does accept it, and drops it without crashing when it
+        #     doesn't.
+        # The override is restored in a finally so it can never leak into an
+        # unrelated later call.
+        global _IMAGE_PROMPTS_BATCH_OVERRIDE
+        _prev_batch_override = _IMAGE_PROMPTS_BATCH_OVERRIDE
+        _IMAGE_PROMPTS_BATCH_OVERRIDE = bool(
+            getattr(self.p, "image_prompts_use_batch_api", False)
         )
+        try:
+            _call_compat(
+                generate_image_prompts,
+                self.shots, self.characters, self.p.theme,
+                cinematic=self.p.cinematic_prompts,
+                expressive=getattr(self.p, "expressive_detail", True),
+                visual_treatment=_visual_treatment,
+                arc_map=_arc_map,
+                use_continuity_context=getattr(self.p, "shot_continuity_context", True),
+                # NOTE: use_batch_api is deliberately NOT passed here. The
+                # override above already carries it, and it reaches the real
+                # function whether or not a wrapper is in the way — whereas a
+                # kwarg only arrives when the installed callable happens to
+                # accept it. One mechanism, same behaviour in both cases.
+            )
+        finally:
+            _IMAGE_PROMPTS_BATCH_OVERRIDE = _prev_batch_override
 
-        # 5. Shot-to-shot continuity summaries — attach prev-shot summaries
-        #    AFTER image prompts are drafted so summaries describe real prompts.
-        #    These summaries are then used by the prompt review pass below.
-        logger.info("[Continuity] Building shot-to-shot continuity summaries…")
-        build_shot_continuity_summaries(self.shots, self.p)
-
-        # 4. Prompt review-and-revise — critic pass over the drafted prompts
+        # 4. Prompt review-and-revise — targeted repair of QC-flagged prompts
         logger.info("[PromptReview] Running art-director review pass…")
         review_and_revise_image_prompts(self.shots, _visual_treatment, self.p)
 
@@ -11314,8 +12221,8 @@ def _make_video_config_filtered(**kwargs) -> "VideoConfig":
 
 
 def notebook_safe_latentsync16_config_from_paths(paths: Dict[str, Any],
-                                                 width: int = 960,
-                                                 height: int = 544,
+                                                 width: int = 1280,
+                                                 height: int = 720,
                                                  fps: int = 24,
                                                  fallback_engine: str = "wan_i2v",
                                                  wan_i2v_steps: int = 32,
