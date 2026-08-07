@@ -124,6 +124,16 @@ from comic_book_continuity import (
     style_negative_terms,
 )
 
+# Post-render visual consistency verification — the "detective" layer that
+# actually looks at rendered pixels (costume colour, screen side, permanent
+# markings, held items, and expression) against what the script established,
+# using a vision-capable LLM. Built as its own module but never wired into
+# the generation loop until now; see the VISION_CONSISTENCY_CHECK gate in
+# generate_panel_images for how it's used — once per checkable panel, on the
+# already cheap-CV-selected best variant, not once per variant (that would be
+# N vision calls per panel, an unbounded cost multiplier).
+import comic_book_visual_consistency as _vc
+
 # Dialogue voice + emotional-delivery layer. Builds a per-character voice profile
 # (origin / accent / heritage / signature lexicon) and a general emotion→delivery
 # model (angry SHOUTS, drunk slurs, happy bubbles over, a seducer purrs) that maps
@@ -311,6 +321,25 @@ def _coerce_opening_segments(parsed: Dict, fallback_visual: str,
             })
     return segments
 
+# Add near the top with other helpers
+def _erotic_intensity(panel: Dict) -> str:
+    text = " ".join(str(v) for v in [
+        panel.get("description", ""), panel.get("beat", ""),
+        panel.get("mood", ""), panel.get("emotional_tone", "")
+    ]).lower()
+    
+    hardcore = ["fuck", "cock", "pussy", "cum", "breed", "slut", "whore", "bdsm", "dominate", 
+                "spank", "choke", "gag", "rough", "thrust", "cream", "orgasm", "climax"]
+    seductive = ["seduce", "naked", "nude", "moan", "wet", "hard", "throb", "kiss", "touch", 
+                 "body", "pleasure", "desire", "arousal"]
+    
+    if any(k in text for k in hardcore):
+        return "hardcore"
+    if any(k in text for k in seductive):
+        return "seductive"
+    if any(k in text for k in ["flirt", "tease", "sexy"]):
+        return "flirty"
+    return "neutral"
 
 def generate_opening_text_page(
     story_idea,
@@ -2417,6 +2446,20 @@ COVER_HEIGHT = 1280
 # prompt quality).
 LLM_PROMPT_REFINEMENT: bool = True
 
+# When True, the already-selected best variant for any panel with checkable
+# visual state (a costume-colour lock, a screen-side lock, a permanent
+# marking, a held item, or an expected emotion) gets ONE extra vision-LLM
+# call verifying the rendered pixels actually match what the script
+# established (see comic_book_visual_consistency.py). If the winner scores
+# below VISION_CONSISTENCY_REGEN_THRESHOLD, the pipeline swaps to the next-
+# best cheap-CV-scored variant instead (never regenerates from scratch — the
+# other variants already exist for free). This is a SPARSE check: one call
+# per checkable panel, not one per variant, so cost stays bounded regardless
+# of variants-per-panel. Set to False to skip it entirely (faster, no vision
+# API cost, relies purely on the cheap CV scoring + text-prompt continuity).
+VISION_CONSISTENCY_CHECK: bool = True
+VISION_CONSISTENCY_REGEN_THRESHOLD: float = 0.5
+
 # ---------------------------------------------------------------------------
 # Panel geometry: valid generation sizes for the diffusion model.
 #
@@ -3060,25 +3103,31 @@ _FEW_SHOT_EXAMPLES = [
     (
         "Digital illustration of a woman in silhouette sitting on a small "
         "wooden boat facing away from the viewer at sunset\n"
-        "Subject: A young woman with long dark hair tied in a ponytail, "
-        "gazing forward toward the horizon with a calm expression\n"
-        "Clothing: She wears loose-fitting traditional robes resembling "
-        "Japanese kimono or gi, layered and draped naturally over her form\n"
+        "Subject: A young woman with long dark hair tied in a low ponytail, "
+        "gazing forward toward the horizon with a calm, contemplative expression; "
+        "her profile catches the last rim of light along the edge of her face\n"
+        "Clothing: She wears loose-fitting traditional robes resembling a "
+        "Japanese kimono or gi, layered and draped naturally over her form, "
+        "fabric soft and slightly translucent where the light hits the edges\n"
         "Pose & Placement: Seated cross-legged inside the boat, hands resting "
-        "on her lap, body turned slightly to face the setting sun; posture "
-        "open and still, weight settled evenly\n"
-        "Environment: Calm water reflects fiery orange hues from the sky, "
-        "distant rocky shores frame the scene under a vast open horizon\n"
+        "lightly on her lap, body turned slightly to face the setting sun; "
+        "posture open and still, weight settled evenly, shoulders relaxed\n"
+        "Environment: Calm water reflects fiery orange and deep crimson hues "
+        "from the sky, distant rocky shores frame the scene under a vast open "
+        "horizon; subtle mist rises from the water surface near the boat\n"
         "Objects: A katana rests beside her in the boat, its handle visible "
-        "and blade sheathed against the hull\n"
+        "and blade sheathed against the hull, the scabbard catching a thin "
+        "strip of reflected sunlight\n"
         "Lighting: Intense warm glow emanates from an enormous red sun "
         "dominating the upper half of the composition, casting dramatic "
-        "reflections on water and silhouetting foreground elements\n"
+        "reflections on water and silhouetting all foreground elements into "
+        "near-black shapes with soft orange edges\n"
         "Style Details: Anime-inspired art style with bold color contrasts, "
         "stylized cloud formations around the sun, bird silhouettes flying "
         "across its edge, and painterly brushwork suggesting motion in "
         "ripples and atmosphere."
     ),
+
     # ── Example 2: WIDE ESTABLISHING SHOT + CAMERA SPEC + NEON PALETTE ──────
     # Layers: subject ✓ | clothing ✓✓ | pose ✓ | environment ✓✓ | camera ✓✓ | lighting ✓✓ | style ✓
     (
@@ -3087,14 +3136,13 @@ _FEW_SHOT_EXAMPLES = [
         "under a starry sky\n"
         "Subject: A girl with short dark hair sitting sideways in profile, "
         "facing away from the camera and gazing out over the distant "
-        "skyline\n"
+        "skyline, expression contemplative and still\n"
         "Clothing: She wears an orange cropped jacket or hoodie, "
         "light-colored shorts revealing her legs, black knee-high socks, "
-        "and chunky black shoes\n"
+        "and chunky black shoes; fabric textures catch neon reflections\n"
         "Pose & Placement: Seated on a flat roof edge with knees bent "
         "slightly forward, weight settled back on both hands placed flat "
-        "behind her; chin level, gaze fixed on the horizon, expression "
-        "contemplative and still\n"
+        "behind her; chin level, gaze fixed on the horizon\n"
         "Environment: A futuristic metropolis filled with glowing "
         "billboards, skyscrapers, flying vehicles, and vibrant streets "
         "stretching into the distance under a deep purple night sky dotted "
@@ -3112,35 +3160,38 @@ _FEW_SHOT_EXAMPLES = [
         "pinks; clean lines blended with painterly brushstrokes reminiscent "
         "of Makoto Shinkai or similar visual novel art styles."
     ),
+
     # ── Example 3: BATTLE STANCE + ENERGY EFFECTS ────────────────────────────
     # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓ | lighting ✓ | style ✓
     (
         "A dynamic anime-style illustration of a muscular warrior in a "
         "powerful battle stance surrounded by explosive energy\n"
-        "Subject: a muscular anime-style warrior with spiky black hair and "
-        "an intense gaze facing left\n"
-        "Clothing: wearing an orange martial arts gi with blue undershirt "
-        "and sash, featuring the kanji 'Kakarotto' on the chest\n"
-        "Pose & Placement: planted in a wide stance, weight forward on the "
+        "Subject: A muscular anime-style warrior with spiky black hair and "
+        "an intense gaze facing left, every muscle defined and tensed\n"
+        "Clothing: Wearing an orange martial arts gi with blue undershirt "
+        "and sash, featuring the kanji 'Kakarotto' on the chest; fabric "
+        "pulls tight across the shoulders and arms\n"
+        "Pose & Placement: Planted in a wide stance, weight forward on the "
         "front foot, fists clenched at chest height and slightly raised; "
         "jaw set, brow furrowed, eyes locked straight ahead — posture "
         "coiled and ready, every muscle braced\n"
-        "Environment: surrounded by swirling energy particles, sparks, "
+        "Environment: Surrounded by swirling energy particles, sparks, "
         "dust clouds, and abstract streaks radiating outward from the figure\n"
-        "Lighting: dramatic high-contrast lighting with warm orange "
+        "Lighting: Dramatic high-contrast lighting with warm orange "
         "highlights on the right side casting deep shadows across the "
         "face and torso\n"
-        "Style Details: gritty painterly texture mixed with digital "
+        "Style Details: Gritty painterly texture mixed with digital "
         "brushwork, splattered ink effects, and dynamic lines emphasizing "
         "speed and intensity."
     ),
+
     # ── Example 4: WINGED FIGURE + WEATHER + SYMBOLIC LIGHTING ──────────────
     # Layers: subject ✓ | pose ✓ | environment ✓✓ | objects ✓✓ | lighting ✓✓ | style ✓✓
     (
         "A dramatic fantasy illustration of a winged woman kneeling in "
         "shallow water beneath a stormy sky breaking into light\n"
         "Subject: A winged woman kneeling low in the water, head slightly "
-        "bowed in a reflective, lowered posture\n"
+        "bowed in a reflective, lowered posture, expression quiet and inward\n"
         "Pose & Placement: Kneeling with both knees in the shallows, weight "
         "sunk and body still; arms loose at her sides, head inclined "
         "forward, a few loose feathers suspended mid-air around her in a "
@@ -3158,6 +3209,7 @@ _FEW_SHOT_EXAMPLES = [
         "transformation, fragility, and quiet strength, captured in a "
         "moment between darkness and light."
     ),
+
     # ── Example 5: TECHNICAL MATERIAL PORTRAIT + SINGLE-SOURCE LIGHTING ─────
     # Layers: subject ✓✓ | environment ✓ | objects ✓✓ | lighting ✓✓ | style ✓✓
     (
@@ -3179,6 +3231,7 @@ _FEW_SHOT_EXAMPLES = [
         "dominate the structural elements with vibrant electric blue "
         "accents."
     ),
+
     # ── Example 6: MULTI-CHARACTER GROUP SHOT + LAYERED SHORELINE ENV ───────
     # Layers: subject ✓✓ | clothing ✓✓ | pose ✓ | environment ✓✓ | objects ✓ | lighting ✓ | style ✓
     (
@@ -3204,6 +3257,7 @@ _FEW_SHOT_EXAMPLES = [
         "faces, richly saturated colours, detailed environmental foreground "
         "elements reminiscent of feature animation."
     ),
+
     # ── Example 7: PURE-ENVIRONMENT ESTABLISHING SHOT, NO HUMAN FIGURE ──────
     # Layers: environment ✓✓ | lighting ✓✓ | style ✓✓ (deliberately subject-optional)
     (
@@ -3221,6 +3275,181 @@ _FEW_SHOT_EXAMPLES = [
         "Style Details: Intricate traditional dragon-art detailing blended with "
         "modern digital rendering, vibrant reds paired with clean whites, dramatic "
         "mythic scale, no human figures anywhere in frame."
+    ),
+
+    # ── Example 8: EXPLICIT NUDITY + TOP-DOWN SELFIE + DETAILED ANATOMY ─────
+    # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓ | lighting ✓✓ | style ✓✓
+    (
+        "Casual smartphone selfie of a woman lying on her back taking a high-angle "
+        "top-down photograph with her top pulled up, fully exposing her bare breasts\n"
+        "Subject: One woman with fair complexion and blonde hair spread messily "
+        "beneath her head, blue-grey eyes looking directly at the lens, closed-mouth "
+        "smile, prominent pink flushing across her cheeks and nose; small silver "
+        "stud earring in her right ear\n"
+        "Clothing: Wearing a muted grayish-blue ribbed long-sleeved top with white "
+        "scalloped lace trim at the neckline; the top is pulled up and bunched tightly "
+        "across her upper chest, completely exposing her large bare breasts\n"
+        "Pose & Placement: Lying on her back, arms extended out of frame to hold the "
+        "camera above her face; face in the upper third of the frame, breasts dominating "
+        "the central foreground; lower abdomen visible below the breasts\n"
+        "Environment: Indoor resting surface, likely a bed; soft rumpled cream-colored "
+        "pillow or sheet behind her head to the left, beige fabric with dark brown "
+        "stylized floral or leaf motifs to the right\n"
+        "Objects: None beyond the clothing and bed surface\n"
+        "Lighting: Soft diffused frontal lighting mixed with the glow of a phone screen; "
+        "gentle catchlights in the eyes, soft rolling specular highlights on the tip of "
+        "her nose, forehead, and the upper curves of her breasts; shallow soft-edged "
+        "shadows pooling under the bunched fabric and deep in the cleavage\n"
+        "Style Details: Casual unedited smartphone selfie photography, deep depth of "
+        "field keeping both face and breasts sharp, mild digital grain and slight loss "
+        "of micro-contrast typical of indoor phone sensors; unidealized skin texture "
+        "with faint blue veins, extensive pink flushing, light tan-pink areolas, "
+        "prominent protruding nipples, and a cluster of small brown moles on the lower "
+        "left breast; warm soft flesh tones against muted pastels."
+    ),
+
+    # ── Example 9: EXPLICIT LESBIAN INTIMACY + HOTEL BEDROOM ─────────────────
+    # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓✓ | lighting ✓ | style ✓
+    (
+        "Detailed cinematic erotic color-pencil style illustration of two beautiful "
+        "young skinny topless women on a rumpled hotel bed at night\n"
+        "Subject: Two young women sitting close together on the bed, kissing tenderly "
+        "with closed eyes, touching each other intimately; expressive faces conveying "
+        "warmth and desire\n"
+        "Clothing: Both topless; soft skin fully visible, no other garments described\n"
+        "Pose & Placement: Seated facing each other on the edge of the bed, bodies "
+        "leaning in, one woman’s hand on the other’s waist or breast, mouths meeting "
+        "in a slow kiss; in the background an adult man is tied to a chair, fully "
+        "clothed, watching in frustration and disbelief\n"
+        "Environment: Cozy hotel bedroom at night, rumpled sheets, soft dim romantic "
+        "lighting, warm color palette, rounded character designs\n"
+        "Objects: Chair with the bound man visible in the mid-background\n"
+        "Lighting: Soft dim romantic lighting creating gentle shadows and pastel "
+        "highlights across skin and fabric\n"
+        "Style Details: Clean linework, expressive faces, cozy nighttime atmosphere, "
+        "romantic and cheeky mood, tasteful sensual erotic and suggestive, stylized "
+        "and playful composition, pastel highlights."
+    ),
+
+    # ── Example 10: EXPLICIT FINGERING + MORNING BEDROOM INTIMACY ────────────
+    # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓✓ | lighting ✓✓ | style ✓
+    (
+        "Softly sunlit apartment bedroom scene of two young women just waking up, "
+        "engaged in intimate mutual pleasure\n"
+        "Subject: Two young women in love; one wears a sexy oversized T-shirt and is "
+        "bottomless without underwear, vagina clearly visible; the other is topless "
+        "and wears loose sexy shorts; both have closed eyes, serene and happy expressions\n"
+        "Clothing: Oversized T-shirt on one (bottomless), loose sexy shorts on the other "
+        "(topless); fabrics soft and slightly rumpled from sleep\n"
+        "Pose & Placement: Lying close together on the unkempt bed, french kissing with "
+        "eyes closed; the topless woman is fingering the other, fingers inside her, "
+        "masturbating her gently; bodies relaxed and intertwined\n"
+        "Environment: Beautiful female bedroom, bed still unkempt from the night, morning "
+        "sun reaching through the window painting golden patterns across the room; plants "
+        "on the windowsill, dust particles floating in the air; subtle details of rumpled "
+        "sheets, mismatched socks, a steaming cup of tea nearby\n"
+        "Objects: Steaming cup of tea, plants on windowsill\n"
+        "Lighting: Warm golden morning sunlight from the window, soft and directional, "
+        "creating gentle highlights and long soft shadows\n"
+        "Style Details: Anime style blending crisp cel-shading with natural textures in "
+        "fabrics, hair, and skin; atmosphere of quiet intimacy and freshness, composition "
+        "focused on tenderness without drama."
+    ),
+
+    # ── Example 11: EXPLICIT LOW-ANGLE NUDITY + DETAILED GENITALIA ───────────
+    # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓ | lighting ✓ | style ✓✓
+    (
+        "Low-angle shot of a blonde Scandinavian 18-year-old woman with green eyes "
+        "standing with legs widely spread and hands on her hips\n"
+        "Subject: Blonde woman with green eyes looking down and smiling; fair skin, "
+        "natural body proportions\n"
+        "Clothing: Completely nude\n"
+        "Pose & Placement: Standing with legs widely spread, hands placed on hips, "
+        "subtly spreading her vulva and anus for visibility; low-angle view from below "
+        "looking upward between her legs\n"
+        "Environment: Neutral or minimal background to keep focus on the body\n"
+        "Objects: None\n"
+        "Lighting: Even natural or soft studio lighting revealing texture and color "
+        "accurately without harsh shadows\n"
+        "Style Details: Photorealistic detail; vagina's opening (introitus) prominently "
+        "visible at the center, pale pink with smooth slightly glossy texture, gentle "
+        "vertical slit suggesting an 'innie' vagina; labia minora and majora lightly "
+        "textured in natural skin tone; coarse dark brown pubic hair above; anus not "
+        "visible at this exact angle; high anatomical accuracy and natural skin "
+        "imperfections."
+    ),
+
+    # ── Example 12: EXPLICIT MASTURBATION + FANTASY MOONLIT SCENE ────────────
+    # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓✓ | lighting ✓✓ | style ✓
+    (
+        "Milonara-style illustration of two beautiful naked young women under a large "
+        "luminous full moon\n"
+        "Subject: One woman with long curly flowing blonde hair, the other with straight "
+        "red hair; both mouths open in expressions of ecstasy and passion, eyes closed; "
+        "skin warm and peachy with light orange shading\n"
+        "Clothing: Completely nude\n"
+        "Pose & Placement: The blonde woman is masturbating the redhead, fingers inside "
+        "the redhead’s vagina; bodies close, hands active, faces tilted upward in shared "
+        "pleasure\n"
+        "Environment: Dark textured black background, large luminous full moon positioned "
+        "behind them, bright white with subtle watercolor-like textures in light green, "
+        "yellow, and blue hues suggesting cosmic or ethereal quality\n"
+        "Objects: None beyond the moon\n"
+        "Lighting: Strong illumination from the moon creating dramatic contrast against "
+        "the dark background, soft glow on skin\n"
+        "Style Details: Strong linework and vibrant yet soft coloring typical of comic "
+        "book or fantasy illustration; sensual and mystical overall impression."
+    ),
+
+    # ── Example 13: EXPLICIT RECLINING NUDITY + INTIMATE HIGH-ANGLE VIEW ─────
+    # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓ | lighting ✓✓ | style ✓
+    (
+        "High-angle view of a woman reclining in languid repose on a plush sofa, "
+        "fully exposing herself\n"
+        "Subject: Woman with long light brown hair cascading over one shoulder, "
+        "smiling directly at the camera with full lips parted to reveal gleaming "
+        "teeth; both hands lifting an intricately knitted multicolored sweater open\n"
+        "Clothing: Intricately knitted multicolored sweater (one red, one blue) "
+        "pulled open and clasped at the waist, fully exposing bare torso and breasts; "
+        "no other clothing\n"
+        "Pose & Placement: Reclining on the sofa, legs spread wide, revealing a "
+        "glistening vulva; relaxed posture with intimate positioning emphasized by "
+        "the high camera angle\n"
+        "Environment: Cozy interior space with green-gray cushions and deep crimson "
+        "blankets framing her form\n"
+        "Objects: The knitted sweater and sofa cushions\n"
+        "Lighting: Single source of even warm ambient light bathing the entire "
+        "composition in gentle realism; soft highlights across skin, subtle shadows "
+        "defining muscle and contour; no harsh contrasts\n"
+        "Style Details: Naturalistic depth through shallow focus on midsection and "
+        "face; tactile quality of woven fabric and smooth flesh; unbroken visual "
+        "clarity, no logo or watermark."
+    ),
+
+    # ── Example 14: EXPLICIT SHOWER SCENE + RAW INTIMACY ─────────────────────
+    # Layers: subject ✓✓ | clothing ✓ | pose ✓✓ | environment ✓✓ | lighting ✓✓ | style ✓
+    (
+        "Amateur iPhone photograph of a young European woman in a luxurious "
+        "marble-tiled shower engaged in an intense intimate moment\n"
+        "Subject: Young woman in her late teens or early twenties, long wet black "
+        "hair clinging to her shoulders, slightly hunched posture, face pressed "
+        "against the cool damp wall; expression a complex mix of intense pleasure "
+        "and palpable distress — eyes wide with subtle eye-roll, lips slightly "
+        "parted and glistening, flushed vibrant skin, blush creeping up neck and cheeks\n"
+        "Clothing: Simple white linen garment clinging to her petite almost fragile "
+        "frame, revealing a large firm breast pressing against the wall\n"
+        "Pose & Placement: Standing with arms held back, fingers clawing at the wall, "
+        "body actively pinned by an unseen force; a dark toned male figure partially "
+        "visible, large white cock straining against her\n"
+        "Environment: Luxurious marble-tiled shower, late afternoon light spilling in, "
+        "damp surfaces, water droplets\n"
+        "Objects: None beyond the architectural surfaces\n"
+        "Lighting: Late afternoon natural light carefully crafted to highlight her "
+        "contours and the dampness of the environment; subtle shadows, candid "
+        "unfiltered quality\n"
+        "Style Details: Realistic amateur photograph aesthetic — candid, unposed, "
+        "natural light, subtle shadows, taken as if for social media; raw, "
+        "unsettling intimacy, high detail on wet skin and fabric cling."
     ),
 ]
 
@@ -9905,8 +10134,80 @@ def _emotion_is_vast(phrase: str, bucket: str, desc: str) -> bool:
     return False
 
 
+def compute_character_focus_weights(script: 'List[Dict]', characters: 'List' = None) -> Dict[str, float]:
+    """Weight each named character by how much the camera should favour them.
+
+    Signal, in priority order:
+      1. Explicit role text ("protagonist"/"lead"/"hero"/"main character") —
+         the strongest, author-given signal.
+      2. Panel-frequency rank — how often the character actually appears in
+         characters_in_frame across the book (reuses the same counting the
+         scene-diversity pass already does, via _diversity_name_key).
+
+    Returns {name: weight}, weight in roughly [0.6, 1.6] — a gentle bias, not
+    a hard cutoff. Background/rarely-seen characters land near 1.0 (no
+    penalty, just no boost); the story's clear leads land highest. Callers
+    multiply a score by this weight, so 1.0 is always neutral.
+
+    With no characters/script, or on any failure, returns {} — callers must
+    treat a missing entry as neutral (1.0), never as a penalty.
+    """
+    if not script:
+        return {}
+    try:
+        counts: Dict[str, int] = {}
+        for page in script:
+            if not isinstance(page, dict) or page.get('_act_break'):
+                continue
+            for panel in (page.get('panels') or []):
+                if not isinstance(panel, dict):
+                    continue
+                for c in (panel.get('characters_in_frame') or []):
+                    key = _diversity_name_key(c)
+                    if key:
+                        counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return {}
+
+        name_by_key: Dict[str, str] = {}
+        role_by_key: Dict[str, str] = {}
+        for c in (characters or []):
+            nm = str(getattr(c, 'name', '') or '').strip()
+            if not nm:
+                continue
+            name_by_key[nm.lower()] = nm
+            role_by_key[nm.lower()] = str(getattr(c, 'role', '') or '').lower()
+
+        explicit_leads = {
+            key for key, role in role_by_key.items()
+            if any(kw in role for kw in ('protagonist', 'lead', 'hero', 'main character'))
+        }
+
+        ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+        n = len(ranked)
+        weights: Dict[str, float] = {}
+        for i, (key, _cnt) in enumerate(ranked):
+            display_name = name_by_key.get(key, key)
+            if key in explicit_leads:
+                w = 1.6
+            elif n <= 1:
+                w = 1.3
+            else:
+                # Top of the frequency ranking gets up to +0.5; the tail
+                # gets a small -0.1 so background cast recedes slightly
+                # rather than competing evenly with the leads for the frame.
+                frac_from_top = 1.0 - (i / max(1, n - 1))
+                w = 0.9 + 0.5 * frac_from_top - (0.0 if frac_from_top > 0.5 else 0.1)
+            weights[display_name] = round(max(0.6, min(1.6, w)), 3)
+        return weights
+    except Exception as e:
+        logger.warning(f"  [Focus] Weight computation failed ({e}); treating all characters as neutral.")
+        return {}
+
+
 def track_emotional_continuity(script: 'List[Dict]',
-                               emotional_arc: Dict = None) -> int:
+                               emotional_arc: Dict = None,
+                               focus_weights: Dict[str, float] = None) -> int:
     """Prevent emotional whiplash AND select emotion-driven close-ups.
 
     Two deterministic jobs in one scene-aware walk:
@@ -9927,8 +10228,16 @@ def track_emotional_continuity(script: 'List[Dict]',
        the signal survives any later page renumbering (splash promotion inserts
        pages).
 
+    focus_weights (see compute_character_focus_weights): when supplied, a
+    panel's close-up candidacy is scaled by the AVERAGE focus weight of the
+    characters in it — so when two panels on the same page have comparably
+    strong emotional turns, the one featuring a lead character wins the
+    page's single close-up slot more often than a background character's.
+    A panel with no weighted characters is unaffected (weight 1.0).
+
     Returns the number of transition notes added. Pure/deterministic, no LLM.
     """
+    focus_weights = focus_weights or {}
     if not script:
         return 0
     arc = emotional_arc or {}
@@ -10030,6 +10339,14 @@ def track_emotional_continuity(script: 'List[Dict]',
                 if _WONDER_AT_NATURE_RE.search(f"{panel_turn_phrase} {desc}"):
                     panel_turn_strength += 0.5
                     panel['_wonder_at_nature'] = True
+                # POV/focus weighting: scale by the average focus weight of the
+                # characters in this panel (1.0 when unweighted or unknown), so
+                # a lead's turn beats a background character's comparably
+                # strong one for the page's single close-up slot.
+                if focus_weights:
+                    _w = [focus_weights.get(str(c), 1.0) for c in chars if focus_weights.get(str(c))]
+                    if _w:
+                        panel_turn_strength *= (sum(_w) / len(_w))
                 closeup_candidates.append((panel_turn_strength, panel, _pos))
 
             # NOW stamp arc data onto the panel (after emotion detection, so the
@@ -10152,6 +10469,7 @@ def amplify_panel_expressions(
     story_idea: 'StoryIdea',
     register: str = '',
     emotional_arc: 'Dict' = None,
+    focus_weights: 'Dict' = None,
 ) -> 'List[Dict]':
     """Inject exaggerated, register-appropriate character-expression attributes
     into emotionally-charged panels so the ART conveys the feeling as strongly
@@ -10163,6 +10481,13 @@ def amplify_panel_expressions(
     emotion unmistakable in this story's register. The answer is stored as a
     sidecar `_expression_amplify` clause that compose_panel_prompt injects — it
     never overwrites the description, so continuity and other passes are intact.
+
+    focus_weights (see compute_character_focus_weights): a panel featuring a
+    strongly-weighted focus character (>=1.3) skips the "already richly
+    described, don't bother re-amplifying" cost-saving shortcut below — leads
+    get the amplification pass even when a background character in the same
+    situation wouldn't, since their emotional beats are the ones a reader is
+    most invested in reading clearly.
 
     When an ``emotional_arc`` is supplied, amplification becomes intensity-aware:
     the per-page intensity is passed to the model so loud/climactic beats get
@@ -10208,11 +10533,15 @@ def amplify_panel_expressions(
             # specific, intensity-appropriate direction. Panels with their own
             # emotional beat are never skipped.
             if loud and not own_beat:
+                _panel_chars = panel.get('characters_in_frame') or []
+                _is_focus_panel = bool(focus_weights) and any(
+                    focus_weights.get(str(c), 1.0) >= 1.3 for c in _panel_chars
+                )
                 already = str(panel.get('_emotion_physicality', '') or '')
                 rich_desc = (len(desc) >= 140
                              and not _EMOTION_LABEL_RE.search(desc)
                              and not _description_needs_enrichment(desc))
-                if len(already) >= 60 and rich_desc:
+                if len(already) >= 60 and rich_desc and not _is_focus_panel:
                     _skipped_enriched += 1
                     continue
             targets.append((panel, page_intensity, arc_emotion))
@@ -12766,7 +13095,8 @@ def plan_page_layouts(script: List[Dict],
         # holds it).
         if (page_script.get('_narration_splash') or importance == 'narration_splash'
                 or page_script.get('_act_interstitial') or importance == 'act_interstitial'
-                or page_script.get('_prologue') or importance == 'prologue'):
+                or page_script.get('_prologue') or importance == 'prologue'
+                or page_script.get('_act_break')):
             importance = 'splash'
             panel_count = 1
             if panels:
@@ -13713,6 +14043,230 @@ def build_emotional_arc(story_idea: 'StoryIdea', script: List[Dict],
         + (f" at p{_peak['_page']}" if _peak and '_page' in _peak else "") + ")."
     )
     return arc
+
+
+def build_character_truth_arc(
+    story_idea: 'StoryIdea',
+    characters: List,
+    required_beats: List[Dict],
+    story_idea_str: str = '',
+    target_pages: int = 24,
+) -> Dict[str, Any]:
+    """Extract each lead character's WANT (external goal) vs. NEED (internal
+    truth) — the classic engine of reader empathy that a plot-only pass never
+    captures. The setup/payoff ledger already tracks whether Chekhov's gun
+    fires; this tracks whether the character's internal lie is ever actually
+    confronted, which is usually what makes a reader feel something rather
+    than just follow along.
+
+    For each lead: the WANT (what they consciously pursue), the misbelief/LIE
+    that's driving their flawed choices, the NEED/TRUTH they must reach, a few
+    concrete SYMPTOM BEHAVIORS the lie produces (useful context for the
+    dialogue and physicality passes), and a one-line CLIMAX TEST — the moment
+    the story should force a choice between the want and the need.
+
+    ONE call for the whole book (batched across every lead at once, not one
+    call per character) — this is naturally small (2-4 leads even in a large
+    ensemble cast) and the characters' arcs are relational, so extracting them
+    together lets the model reason about how they pressure each other.
+
+    Returns {} on failure or when the story has no clear lead (degrades to a
+    silent no-op everywhere it's consumed). Never raises.
+    """
+    if not characters:
+        return {}
+
+    # Leads only — role text match first (explicit authorial signal), else
+    # the first few named characters as a reasonable fallback for stories
+    # that don't tag roles explicitly.
+    leads = [c for c in characters
+             if any(kw in str(getattr(c, 'role', '') or '').lower()
+                    for kw in ('protagonist', 'lead', 'hero', 'main character'))]
+    if not leads:
+        leads = list(characters)[:3]
+    leads = leads[:4]   # a 4th+ POV thread rarely earns its own internal arc
+
+    char_block = "\n".join(
+        f"  {c.name} | Role: {getattr(c, 'role', '') or 'unspecified'} | "
+        f"Traits: {', '.join(getattr(c, 'traits', []) or [])[:100]} | "
+        f"Backstory: {(getattr(c, 'backstory', '') or '')[:150]} | "
+        f"Stated arc: {(getattr(c, 'arc', '') or '')[:120]}"
+        for c in leads
+    )
+    beat_spine = "\n".join(
+        f"  {b.get('beat_id','?')} (pp.{b.get('page_range','?')}): "
+        f"{str(b.get('description',''))[:120]}"
+        for b in (required_beats or [])[:20]
+    )
+
+    prompt = (
+        "You are a story editor identifying the INTERNAL engine of this "
+        "graphic novel — the thing that makes a reader feel something, not "
+        "just follow the plot.\n\n"
+        "For EACH lead character below, work out:\n"
+        "  WANT   — the concrete, external goal they consciously pursue "
+        "(what they'd tell you they're trying to do)\n"
+        "  LIE    — the false belief about themselves or the world driving "
+        "their flawed choices (what they wrongly believe is true)\n"
+        "  NEED   — the internal truth they must actually reach for the "
+        "story to feel complete (what reality will eventually force on them)\n"
+        "  SYMPTOMS — 2-3 concrete BEHAVIORS (not feelings) the lie produces: "
+        "specific things this character DOES because they believe the lie\n"
+        "  CLIMAX_TEST — one sentence: the moment the story should force a "
+        "choice between the WANT and the NEED\n\n"
+        "The WANT and NEED should usually be in tension — pursuing the want "
+        "AS THEY UNDERSTAND IT should make reaching the need harder, not "
+        "easier. A protagonist who wants X and needs X isn't an arc, it's a "
+        "checklist.\n\n"
+        f"GENRE: {story_idea.genre}\nMOOD: {story_idea.mood}\n"
+        f"THEMES: {', '.join(story_idea.themes or [])}\n"
+        f"PREMISE: {(story_idea_str or story_idea.premise or '')[:500]}\n\n"
+        f"LEAD CHARACTERS:\n{char_block}\n\n"
+        f"STORY BEATS (for context — use to ground CLIMAX_TEST in an actual "
+        f"moment, not a generic one):\n{beat_spine}\n\n"
+        "Return JSON only:\n"
+        "{\n"
+        '  "leads": [\n'
+        "    {\n"
+        '      "name": "CharacterName",\n'
+        '      "want": "...",\n'
+        '      "lie": "...",\n'
+        '      "need": "...",\n'
+        '      "symptom_behaviors": ["...", "..."],\n'
+        '      "climax_test": "..."\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "JSON only. Omit any lead whose story genuinely has no internal arc "
+        "(a pure plot-mechanism character) rather than inventing one."
+    )
+
+    try:
+        raw = get_openai_prompt_response(
+            prompt, temperature=0.65, max_completion_tokens=2500,
+            openai_model=openai_model_large, use_grok=USE_GROK,
+        )
+        parsed = parse_json_response(raw) or {}
+        leads_out = parsed.get("leads") or []
+        if not isinstance(leads_out, list):
+            return {}
+        arc: Dict[str, Any] = {}
+        for entry in leads_out:
+            if not isinstance(entry, dict) or not entry.get("name"):
+                continue
+            name = str(entry["name"]).strip()
+            if not name:
+                continue
+            arc[name] = {
+                "want": str(entry.get("want", "") or "").strip(),
+                "lie": str(entry.get("lie", "") or "").strip(),
+                "need": str(entry.get("need", "") or "").strip(),
+                "symptom_behaviors": [
+                    str(s).strip() for s in (entry.get("symptom_behaviors") or [])
+                    if str(s).strip()
+                ][:3],
+                "climax_test": str(entry.get("climax_test", "") or "").strip(),
+            }
+        if arc:
+            logger.info(
+                "  [TruthArc] Extracted want/need arcs for: %s",
+                ", ".join(arc.keys()),
+            )
+        return arc
+    except Exception as e:
+        logger.warning(f"  [TruthArc] Extraction failed ({e}); skipping.")
+        return {}
+
+
+def tag_want_need_beats(script: List[Dict], truth_arc: Dict[str, Any]) -> int:
+    """Deterministically annotate panels where a lead's want/need conflict is
+    plausibly live, so downstream dialogue/narration passes have a concrete
+    hook instead of the internal arc only ever living in an unused sidecar
+    dict. No LLM — pattern-matches each lead's `symptom_behaviors` and `lie`
+    keywords against panel/page text already on the script.
+
+    Sets panel['_want_need_focus'] = {'character', 'lie', 'need'} on matches.
+    Returns the number of panels tagged.
+    """
+    if not script or not truth_arc:
+        return 0
+    tagged = 0
+    for page in script:
+        if not isinstance(page, dict) or page.get('_act_break'):
+            continue
+        for panel in (page.get('panels') or []):
+            if not isinstance(panel, dict):
+                continue
+            chars_here = [str(c) for c in (panel.get('characters_in_frame') or [])]
+            for name, info in truth_arc.items():
+                if name not in chars_here:
+                    continue
+                desc = str(panel.get('description', '') or '').lower()
+                dlg_text = ' '.join(
+                    str(d.get('text', '')) for d in (panel.get('dialogue') or [])
+                    if isinstance(d, dict)
+                ).lower()
+                blob = desc + ' ' + dlg_text
+                symptoms = info.get('symptom_behaviors') or []
+                hit = any(
+                    _kw.lower() in blob for s in symptoms
+                    for _kw in [w for w in s.split() if len(w) > 5][:3]
+                )
+                if hit:
+                    panel['_want_need_focus'] = {
+                        'character': name,
+                        'lie': info.get('lie', ''),
+                        'need': info.get('need', ''),
+                    }
+                    tagged += 1
+    if tagged:
+        logger.info(f"  [TruthArc] Tagged {tagged} panel(s) with a live want/need conflict.")
+    return tagged
+
+
+def verify_climax_delivers_truth(script: List[Dict], truth_arc: Dict[str, Any]) -> List[str]:
+    """Cheap, deterministic post-hoc check: does the book's designated climax
+    region actually contain a want/need beat for at least one lead? No LLM —
+    just checks whether _designate_climax_page's page (or its immediate
+    neighbourhood) has any _want_need_focus tag from tag_want_need_beats.
+
+    Returns a list of human-readable warnings (empty = no concerns found).
+    This is a SIGNAL, not an enforcement — the caller decides whether to feed
+    it to the cold-read QA pass, log it, or ignore it; the internal arc is a
+    craft judgement call, not something to force-rewrite mechanically.
+    """
+    warnings: List[str] = []
+    if not script or not truth_arc:
+        return warnings
+    try:
+        climax_page = _designate_climax_page(script)
+    except Exception:
+        climax_page = None
+    if not climax_page:
+        return warnings
+
+    window = set(range(max(1, climax_page - 2), climax_page + 3))
+    hits: set = set()
+    for page in script:
+        if not isinstance(page, dict) or int(page.get('page', 0)) not in window:
+            continue
+        for panel in (page.get('panels') or []):
+            focus = panel.get('_want_need_focus') if isinstance(panel, dict) else None
+            if focus and focus.get('character'):
+                hits.add(focus['character'])
+
+    for name in truth_arc:
+        if name not in hits:
+            warnings.append(
+                f"{name}'s want/need conflict ('{truth_arc[name].get('lie','')}' vs "
+                f"'{truth_arc[name].get('need','')}') doesn't appear to surface near "
+                f"the climax (page {climax_page}) — the plot may resolve without the "
+                f"internal arc paying off."
+            )
+    if warnings:
+        for w in warnings:
+            logger.info(f"  [TruthArc] {w}")
+    return warnings
 
 
 def reinforce_arc_from_beat_critic(
@@ -15677,15 +16231,26 @@ def _render_prompt_zimage(components: Dict[str, str], summary: str) -> str:
     """Render the ZIMAGE structured prompt as labelled sections, in the order
     Z-Image was tuned on.
 
-    The prompt begins directly at ``Subject:`` — we deliberately do NOT prepend
-    the ``summary`` opener. That opener restated the art style (already carried
-    by the Style Details section / the style parameter) and paraphrased the raw
-    panel description (already decomposed across Subject / Pose & Placement /
-    Environment), so emitting it duplicated the subject and style at the top of
-    every prompt. ``summary`` is still accepted (and used upstream as context
-    for the LLM refinement step) but is not rendered into the final prompt.
+    ART STYLE PREFIX (dedicated, always first): ``summary`` now carries ONLY
+    the resolved style/medium anchor (see compose_panel_prompt — it no longer
+    paraphrases the subject/action into this line), so it is rendered here as
+    its own leading "Art Style:" line before Subject/Clothing/etc.
+    Few-step distilled diffusion models weight earlier tokens most heavily and
+    lose adherence to anything buried near the end of a long structured
+    prompt — this pipeline's own style-continuity system (track_style_
+    continuity / style_positive_anchor) was designed around that fact ("the
+    same medium statement is the first, highest-weighted thing the model
+    reads on every panel"), but a prior version of this renderer dropped the
+    line entirely, silently disabling that defence for every image model.
+    Putting it back as a short, undiluted prefix — separate from the fuller
+    Style Details section below, which still carries technique/mood flavour —
+    is what actually keeps the art style consistent panel-to-panel instead of
+    occasionally drifting toward photorealism.
     """
     lines = []
+    style_prefix = _clean_section(summary)
+    if style_prefix:
+        lines.append(f"Art Style: {style_prefix}")
     for key in _ZIMAGE_SECTION_ORDER:
         body = _clean_section(components.get(key, ''))
         if body:
@@ -16162,6 +16727,17 @@ def compose_narration_background_prompt(
         + "\nWrite the image description now."
     )
 
+    # ── Dedicated art-style prefix ────────────────────────────────────────────
+    # Rendered first, same reasoning as compose_panel_prompt / _render_prompt_
+    # zimage: the LLM below is only ever TOLD the style as an instruction
+    # ("Illustrated/painted style only — no photorealism"), and instructions
+    # are not guaranteed to survive into a model's own creative-writing output.
+    # Prefixing the literal style words onto whatever description comes back —
+    # from either the LLM or the deterministic fallback — means the actual
+    # text sent to the diffusion model always carries the book's medium,
+    # instead of relying on the LLM to have restated it unprompted.
+    style_prefix = f"Art Style: {art_style.rstrip('.')}.\n"
+
     try:
         raw = get_openai_prompt_response(
             llm_prompt,
@@ -16172,7 +16748,7 @@ def compose_narration_background_prompt(
         )
         description = _strip_meta_tags_from_prompt((raw or '').strip())
         if description and len(description) > 30:
-            return description + '\n' + ANTI_PHOTOREALISM_CLAUSE
+            return style_prefix + description + '\n' + ANTI_PHOTOREALISM_CLAUSE
     except Exception as _e:
         logger.warning(f"[NarrBGPrompt] LLM call failed ({_e}); using fallback.")
 
@@ -16185,7 +16761,7 @@ def compose_narration_background_prompt(
         "Wide atmospheric composition, soft depth of field, lighter centre "
         "with richer tonal edges."
     )
-    return _strip_meta_tags_from_prompt(fallback) + '\n' + ANTI_PHOTOREALISM_CLAUSE
+    return style_prefix + _strip_meta_tags_from_prompt(fallback) + '\n' + ANTI_PHOTOREALISM_CLAUSE
 
 
 def _llm_refine_panel_prompt(
@@ -17427,14 +18003,16 @@ def compose_panel_prompt(panel_script: Dict, story_idea: StoryIdea,
 
     _model = _active_image_model()
 
-    # ── Summary line: art style + core action ──────────────────────────────
-    _summary_bits = []
-    if art_style_clean:
-        _summary_bits.append(art_style_clean.rstrip(' ,.'))
-    _desc_lead = (description or '').strip()
-    if _desc_lead:
-        _summary_bits.append(_desc_lead.rstrip(' .'))
-    summary = '. '.join(b for b in _summary_bits if b)
+    # ── Summary line: art style anchor ONLY ─────────────────────────────────
+    # This is the dedicated ART STYLE PREFIX rendered first by
+    # _render_prompt_zimage — the single highest-weighted line the model
+    # reads. It must stay a clean, undiluted medium statement (art_style_clean,
+    # or the stronger _style_anchor from track_style_continuity when present)
+    # and never be re-merged with a paraphrase of the subject/action — that
+    # content already lives in the Subject / Pose & Placement sections below,
+    # and duplicating it here is exactly what the previous design avoided by
+    # dropping the line entirely (which also threw away the style anchor).
+    summary = art_style_clean
 
     # ── Subject: identity ──────────────────────────────────────────────────
     _subject_bits = []
@@ -18828,6 +19406,17 @@ def _compute_final_page_numbers(script: List[Dict]) -> Dict[int, int]:
     orig_nums = sorted(int(p.get('page', 0)) for p in story_pages)
     page_map: Dict[int, int] = {n: n for n in orig_nums}
 
+    # If act-break pages already physically exist in the script, every page
+    # number is ALREADY final (insert_act_break_placeholders() now runs
+    # before image generation, well before this function is ever called) —
+    # predicting and applying another offset on top would double-shift
+    # everything after the first break. Only the legacy path (a script that
+    # has no act breaks yet, e.g. an older working directory being rebuilt
+    # with insert_act_breaks() called post-generation) needs the prediction
+    # below.
+    if any(p.get('_act_break') for p in script):
+        return page_map
+
     if n_story <= 20:
         return page_map
 
@@ -18882,9 +19471,170 @@ def _compute_final_page_numbers(script: List[Dict]) -> Dict[int, int]:
 # variant set (relative selection), which is all we need.
 # =============================================================================
 
+def _face_identity_descriptor(face_gray_crop: 'np.ndarray') -> Optional['np.ndarray']:
+    """Cheap, dependency-free face descriptor for catching GROSS identity drift.
+
+    This is deliberately NOT a trained face-recognition embedding (no
+    ArcFace/InsightFace/dlib dependency, no model weights to fetch) — it's a
+    lightweight Local-Binary-Pattern-style texture/shape signature: resize the
+    crop to a fixed size, split into a grid, and for each cell compute a
+    coarse gradient-orientation histogram. Two crops of the SAME illustrated
+    character (same face shape, same shading pattern, same hair silhouette
+    framing the face) land close together in this space; two crops of
+    visibly DIFFERENT people (different proportions, different value
+    structure) land far apart. It will not catch subtle drift the way a real
+    embedding model would, but it costs nothing, needs nothing installed
+    beyond numpy, and is good enough to catch the failure mode that actually
+    breaks a reader's trust — a character who looks like a different person
+    from one page to the next.
+
+    Returns a fixed-length float32 vector, or None if the crop is unusable.
+    """
+    try:
+        import numpy as _np
+        if face_gray_crop is None or face_gray_crop.size == 0:
+            return None
+        try:
+            import cv2 as _cv2
+            crop = _cv2.resize(face_gray_crop, (64, 64))
+        except Exception:
+            # numpy-only nearest-neighbour resize fallback.
+            h0, w0 = face_gray_crop.shape[:2]
+            ys = (_np.linspace(0, h0 - 1, 64)).astype(_np.int32)
+            xs = (_np.linspace(0, w0 - 1, 64)).astype(_np.int32)
+            crop = face_gray_crop[ys][:, xs]
+        crop = crop.astype(_np.float32)
+        crop = (crop - crop.mean()) / (crop.std() + 1e-6)   # lighting-invariant
+
+        # Per-cell gradient-orientation histogram (a cheap HOG-like signature).
+        gy, gx = _np.gradient(crop)
+        mag = _np.sqrt(gx ** 2 + gy ** 2)
+        ang = (_np.arctan2(gy, gx) + _np.pi)   # 0..2pi
+        n_bins = 8
+        bin_idx = _np.clip((ang / (2 * _np.pi) * n_bins).astype(_np.int32), 0, n_bins - 1)
+
+        cells = 8   # 8x8 grid over the 64x64 crop = 8px cells
+        cell_sz = 64 // cells
+        desc = _np.zeros(cells * cells * n_bins, dtype=_np.float32)
+        for cy in range(cells):
+            for cx in range(cells):
+                y0, y1 = cy * cell_sz, (cy + 1) * cell_sz
+                x0, x1 = cx * cell_sz, (cx + 1) * cell_sz
+                cell_bins = bin_idx[y0:y1, x0:x1]
+                cell_mag = mag[y0:y1, x0:x1]
+                hist = _np.bincount(cell_bins.ravel(), weights=cell_mag.ravel(),
+                                     minlength=n_bins)[:n_bins]
+                start = (cy * cells + cx) * n_bins
+                desc[start:start + n_bins] = hist
+        norm = _np.linalg.norm(desc)
+        if norm < 1e-6:
+            return None
+        return desc / norm
+    except Exception:
+        return None
+
+
+def _identity_similarity(desc_a: Optional['np.ndarray'],
+                          desc_b: Optional['np.ndarray']) -> Optional[float]:
+    """Cosine similarity between two face descriptors, in 0..1. None if either
+    is missing (caller treats that as 'no signal', never as a penalty)."""
+    if desc_a is None or desc_b is None:
+        return None
+    try:
+        import numpy as _np
+        sim = float(_np.dot(desc_a, desc_b))   # both already L2-normalised
+        return max(0.0, min(1.0, (sim + 1.0) / 2.0))
+    except Exception:
+        return None
+
+
+# Coarse expression buckets the cheap CV heuristic below can plausibly tell
+# apart from Haar-cascade geometry alone. Deliberately coarser than the
+# script's 12-way _EMOTION_BUCKETS — a stylised illustrated face doesn't give
+# a Haar cascade enough to distinguish "frustration" from "anger", but "is
+# this face doing something joyful, something openly distressed/alarmed, or
+# something closed-off/neutral" is a signal cheap geometry can actually
+# support. Mismatches here are a soft, small scoring nudge, not a hard gate —
+# the sparser vision-LLM check (see wiring in generate_panel_images) is the
+# real backstop for anything this coarse heuristic gets wrong.
+_EMOTION_BUCKET_TO_COARSE = {
+    'joy': 'joy', 'excitement': 'joy', 'tender': 'joy', 'wonder': 'joy',
+    'sadness': 'distress', 'anger': 'distress', 'frustration': 'distress',
+    'disgust': 'distress',
+    'fear': 'alarm', 'surprise': 'alarm', 'tension': 'alarm',
+    'calm': 'neutral',
+}
+
+
+def _coarse_emotion_bucket(bucket_or_phrase: str) -> str:
+    """Map either a raw _classify_emotion_bucket() label or a free mood phrase
+    to the coarse {joy, distress, alarm, neutral} space, or '' if undetermined."""
+    if not bucket_or_phrase:
+        return ''
+    b = _classify_emotion_bucket(bucket_or_phrase) or ''
+    return _EMOTION_BUCKET_TO_COARSE.get(b, '')
+
+
+def _face_expression_signal(face_gray_crop: 'np.ndarray') -> str:
+    """Coarse expression read from a face crop: 'joy' | 'distress' | 'alarm' |
+    'neutral' | '' (undetermined). Cheap Haar-cascade + intensity heuristics —
+    see _EMOTION_BUCKET_TO_COARSE for why the output space is this coarse.
+    """
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+    except Exception:
+        return ''
+    try:
+        if face_gray_crop is None or face_gray_crop.size == 0:
+            return ''
+        fh, fw = face_gray_crop.shape[:2]
+        if fh < 24 or fw < 24:
+            return ''
+
+        # Smile cascade (bundled with opencv-python) run on the lower half of
+        # the face, where a smile lives — the standard way to keep it from
+        # false-firing on eyes/eyebrows elsewhere in the crop.
+        lower = face_gray_crop[int(fh * 0.5):, :]
+        smile_cascade = _cv2.CascadeClassifier(
+            _cv2.data.haarcascades + 'haarcascade_smile.xml')
+        smiles = smile_cascade.detectMultiScale(
+            lower, scaleFactor=1.7, minNeighbors=18,
+            minSize=(max(8, fw // 4), max(6, fh // 8)))
+        if len(smiles) > 0:
+            return 'joy'
+
+        # Mouth-region openness: a bright/dark high-contrast band spanning
+        # most of the lower-face width reads as an open mouth (shout, gasp,
+        # scream) rather than a closed, composed one.
+        mouth_band = face_gray_crop[int(fh * 0.62):int(fh * 0.92), int(fw * 0.2):int(fw * 0.8)]
+        if mouth_band.size:
+            mband = mouth_band.astype(_np.float32)
+            openness = float(mband.std())
+            if openness > 42.0:
+                return 'alarm'
+
+        # Brow/upper-face furrow: concentrated vertical gradient energy
+        # between the eyes reads as a lowered/knit brow (anger, grief,
+        # concentration) rather than a smooth, relaxed forehead.
+        brow_band = face_gray_crop[int(fh * 0.18):int(fh * 0.42), int(fw * 0.3):int(fw * 0.7)]
+        if brow_band.size:
+            bb = brow_band.astype(_np.float32)
+            gy, gx = _np.gradient(bb)
+            furrow = float(_np.sqrt(gx ** 2 + gy ** 2).mean())
+            if furrow > 18.0:
+                return 'distress'
+
+        return 'neutral'
+    except Exception:
+        return ''
+
+
 def _score_panel_variant(image_np: 'np.ndarray',
                           expect_faces: bool = False,
-                          palette_ref: Optional[Dict[str, float]] = None
+                          palette_ref: Optional[Dict[str, float]] = None,
+                          identity_ref: Optional['np.ndarray'] = None,
+                          expected_emotion_bucket: str = '',
                           ) -> Tuple[float, Dict[str, float]]:
     """Score a single generated panel (H×W×3 uint8 RGB). Higher is better.
 
@@ -18898,6 +19648,25 @@ def _score_panel_variant(image_np: 'np.ndarray',
     loses to a variant whose face resolved cleanly.  Neutral (no effect) when
     no face is detected, so stylised/profile/distant faces are never unfairly
     penalised; the component only ever acts on faces it can actually see.
+
+    identity_ref: the panel's character's running face descriptor (see
+    _face_identity_descriptor), when the caller has been tracking one for a
+    single dominant named character in frame. A variant whose face drifts far
+    from that running reference is penalised — this is what catches "this
+    doesn't look like the same person as three pages ago" instead of relying
+    purely on the text prompt to hold identity steady. None (no reference yet
+    — e.g. the character's first panel) means no effect.
+
+    expected_emotion_bucket: the script's intended coarse emotion for this
+    panel (see _coarse_emotion_bucket). When set and a face is detected, a
+    cheap geometric read of the face's expression is compared against it —
+    a scripted "grief" next to a detected "joy" is a real mismatch and is
+    penalised; a scripted "grief" next to an undetermined read is neutral
+    (the heuristic isn't confident enough to penalise on a maybe).
+
+    breakdown['face_descriptor'] carries the WINNING face's own descriptor
+    (or None) so callers can update their running per-character reference
+    without detecting the face a second time.
     """
     import numpy as _np
     try:
@@ -18999,6 +19768,9 @@ def _score_panel_variant(image_np: 'np.ndarray',
     #   - NO face detected → exactly 0.0 (profiles, distant figures, and
     #     stylised faces the cascade misses are never punished)
     face_focus = 0.0
+    identity_score = 0.0
+    expression_score = 0.0
+    face_descriptor = None
     if expect_faces and _HAVE_CV2:
         try:
             cascade = _cv2.CascadeClassifier(
@@ -19025,9 +19797,36 @@ def _score_panel_variant(image_np: 'np.ndarray',
                         face_focus = -min(1.0, (60.0 - lap_var) / 60.0)
                     else:
                         face_focus = min(1.25, (lap_var - 60.0) / 400.0)
+
+                    # ── Identity similarity against the running reference ────
+                    face_descriptor = _face_identity_descriptor(crop)
+                    if identity_ref is not None:
+                        sim = _identity_similarity(face_descriptor, identity_ref)
+                        if sim is not None:
+                            # Centred so "matches the reference" (sim~0.8+) is
+                            # a small bonus and "drifted" (sim<0.5) is a real
+                            # penalty; a genuinely close match shouldn't swing
+                            # the score much harder than a sharp-vs-soft face
+                            # already does, since this descriptor is a coarse
+                            # signal, not a verified identity match.
+                            identity_score = (sim - 0.55) * 1.6
+
+                    # ── Expression match against the scripted emotion ────────
+                    if expected_emotion_bucket:
+                        detected = _face_expression_signal(crop)
+                        if detected and detected != '':
+                            if detected == expected_emotion_bucket:
+                                expression_score = 0.5
+                            elif detected == 'neutral' or expected_emotion_bucket == 'neutral':
+                                expression_score = 0.0   # ambiguous, not a real mismatch
+                            else:
+                                expression_score = -0.75  # opposing coarse buckets
         except Exception:
             face_focus = 0.0
     breakdown['face_focus'] = face_focus
+    breakdown['identity_score'] = identity_score
+    breakdown['expression_score'] = expression_score
+    breakdown['face_descriptor'] = face_descriptor
 
     # --- 5. Oversaturation / colour-cast health ------------------------------
     # Few-step (turbo/lightning) models occasionally return neon-fried
@@ -19089,6 +19888,8 @@ def _score_panel_variant(image_np: 'np.ndarray',
         + 0.60 * variance_score
         + 0.50 * midtone_score
         + 0.80 * face_focus          # bonus when positive, penalty when negative
+        + 0.70 * identity_score      # bonus/penalty vs the character's running face reference
+        + 0.55 * expression_score    # bonus/penalty vs the scripted emotion
         - 2.50 * text_penalty
         - 1.50 * blank_penalty
         - 1.20 * contrast_penalty
@@ -19182,7 +19983,8 @@ def _hue_distance(a: float, b: float) -> float:
 
 def _reconcile_page_palette(page_manifest: Dict,
                             score_margin: float = 0.15,
-                            hue_threshold: float = 0.12) -> int:
+                            hue_threshold: float = 0.12,
+                            protected_panel_keys: Optional[set] = None) -> int:
     """Re-select variants across a page so adjacent panels don't clash in colour.
 
     After each panel picks its own best variant in isolation, a page can end up
@@ -19200,11 +20002,28 @@ def _reconcile_page_palette(page_manifest: Dict,
                          still be eligible (0.15 = within 15%).
     ``hue_threshold``  : hue distance (0..0.5) above which two panels are treated
                          as clashing and reconciliation is attempted.
+    ``protected_panel_keys`` : panel keys (e.g. "panel_02") to NEVER re-select,
+                         even if they clash in hue with their neighbours. This
+                         is how the caller protects panels with a checkable
+                         appearance ledger (a locked costume colour, screen
+                         side, permanent marking, or held item): this pass only
+                         compares OVERALL dominant hue, with no notion of which
+                         pixels are "the character's shirt" versus background,
+                         so a hue-closer runner-up is not guaranteed — and often
+                         isn't — a better costume-colour match. Swapping on hue
+                         alone for these panels is exactly how a correctly
+                         rendered, already-verified outfit gets silently
+                         replaced by a variant where the same garment rendered
+                         a different colour, purely to match a neighbour's
+                         palette. Protected panels are still used as neighbour
+                         reference points for OTHER panels' reconciliation —
+                         only their own selection is frozen.
     """
     # Collect the panel keys in document order (skip metadata keys starting "_").
     panel_keys = [k for k in page_manifest.keys() if not k.startswith('_')]
     if len(panel_keys) < 2:
         return 0
+    _protected = protected_panel_keys or set()
 
     def _sig_of(rec: Dict, active_idx: int) -> Optional[Dict]:
         for v in rec.get('variants', []):
@@ -19215,6 +20034,11 @@ def _reconcile_page_palette(page_manifest: Dict,
     # Current chosen hue per panel.
     changed = 0
     for i, pk in enumerate(panel_keys):
+        if pk in _protected:
+            # Frozen: this panel's selection already passed (or is exempt from
+            # needing) costume-colour scrutiny that this pass cannot perform.
+            # It still contributes its own hue as a neighbour reference below.
+            continue
         rec = page_manifest.get(pk, {})
         variants = rec.get('variants', [])
         if len(variants) < 2:
@@ -19306,6 +20130,10 @@ def _manifest_page_type_and_label(page_script: Dict, final_page_num: int) -> Tup
     act-interstitial rendering never activates and the rich narration pages
     show up as ordinary (often near-empty) panels.
     """
+    if page_script.get('_act_break'):
+        act_labels = {'1': 'One', '2': 'Two', '3': 'Three', '4': 'Four', '5': 'Five'}
+        act_word = act_labels.get(str(page_script.get('act', '1')), str(page_script.get('act', '1')))
+        return 'act_break', (page_script.get('title', '').strip() or f"Act {act_word}")
     if (page_script.get('_act_interstitial')
             or page_script.get('importance') == 'act_interstitial'
             or str(page_script.get('beat_type', '')) == 'act_interstitial'):
@@ -19429,6 +20257,7 @@ def build_panel_manifest_prompts(
             '_page_type':   _pt,
             '_act':         act_str,
             '_page_number': final_page_num,
+            '_is_act_break': bool(page_script.get('_act_break')),
         }
 
         _page_panel_pixel_dims = _compute_page_panel_pixel_dims(layout)
@@ -19507,9 +20336,11 @@ def build_panel_manifest_prompts(
                     scene_anchor = None
 
             # Compose the final prompt
-            # Narration-splash and act-interstitial panels need a background
-            # image prompt (atmospheric/conceptual art suitable as a text
-            # canvas) not a story-scene prompt.
+            # Act-break, narration-splash, and act-interstitial panels each
+            # need their own dedicated prompt builder, not the standard
+            # story-scene prompt (which expects real character/scene
+            # description context these placeholder pages don't carry).
+            _is_act_break_panel = bool(page_script.get('_act_break'))
             _is_narr_panel = (
                 page_script.get('_narration_splash')
                 or page_script.get('_act_interstitial')
@@ -19518,7 +20349,17 @@ def build_panel_manifest_prompts(
                    ('narration_heavy', 'interstitial_story_page')
                 or panel_script.get('panel_type') == 'narration'
             )
-            if _is_narr_panel:
+            if _is_act_break_panel:
+                _act_pages_ctx = [
+                    p for p in script
+                    if str(p.get('act', '')) == str(page_script.get('act', '1'))
+                    and not p.get('_act_break')
+                ]
+                prompt = _build_act_break_prompt(
+                    page_script, project.story_dna, project.story_idea,
+                    arc_state, _act_pages_ctx,
+                )
+            elif _is_narr_panel:
                 import novel_generator as _ng_ref
                 _active_model = getattr(_ng_ref, 'IMAGE_MODEL', 'ZIMAGE')
                 prompt = compose_narration_background_prompt(
@@ -19739,6 +20580,17 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
     total_panels = sum(len(p.get('panels', [])) for p in script)
     panel_counter = 0
 
+    # Running per-character face-identity reference (see _face_identity_
+    # descriptor / _identity_similarity). Persists for the WHOLE book, not
+    # reset per page, so a character reappearing many pages after their last
+    # panel is still checked against their established look. Only updated
+    # for panels with exactly one named human character in frame — with two
+    # characters sharing a panel there's no reliable way to know which
+    # detected face belongs to which name from Haar geometry alone, so those
+    # panels are read (skipped) rather than risk updating the wrong
+    # character's reference with someone else's face.
+    _character_face_ref: Dict[str, 'np.ndarray'] = {}
+
     # Pre-compute final page numbers so panel files are named correctly from
     # the start (e.g. page_002_* when an Act I break will be inserted at page 1).
     # This eliminates the post-generation rename step in insert_act_breaks.
@@ -19788,6 +20640,7 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
             '_page_type':   _pt,
             '_act':         act_str,
             '_page_number': final_page_num,
+            '_is_act_break': bool(page_script.get('_act_break')),
         }
 
         # Pre-compute the exact pixel dimensions of every panel slot on this
@@ -19806,6 +20659,15 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
         page_anchor_ctx = None     # set from the first panel = the establishing shot
         prev_panel_ctx = None      # the immediately preceding panel
         _prev_panel_color_sig = None  # dominant-colour sig of the previous panel's pick
+        # panel_keys on THIS page whose appearance ledger is checkable (a locked
+        # costume colour, screen side, permanent marking, or held item). Palette
+        # reconciliation below must never re-pick one of these panels' variants
+        # on hue alone — it has no notion of costume correctness, and doing so
+        # is how a correctly-selected "blue shirt" panel gets silently swapped
+        # for a variant where the shirt rendered green just because a
+        # neighbouring panel's overall palette skewed that way. See the
+        # reconciliation call at the end of the panel loop below.
+        _ledger_protected_panel_keys: set = set()
 
         # Scene-consistency trackers — scoped to a scene (may span multiple pages
         # if the setting doesn't change, but we reset conservatively on each new
@@ -19996,9 +20858,10 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
                         )
             else:
                 # Compose final prompt, threading sequential continuity context.
-                # Narration-splash and act-interstitial panels use a dedicated
-                # background-image prompt (atmospheric/conceptual art as a text
-                # canvas) instead of the standard story-scene prompt builder.
+                # Act-break, narration-splash, and act-interstitial panels each
+                # use a dedicated prompt builder instead of the standard
+                # story-scene prompt builder.
+                _is_act_break_panel = bool(page_script.get('_act_break'))
                 _is_narr_panel = (
                     page_script.get('_narration_splash')
                     or page_script.get('_act_interstitial')
@@ -20007,7 +20870,21 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
                        ('narration_heavy', 'interstitial_story_page')
                     or panel_script.get('panel_type') == 'narration'
                 )
-                if _is_narr_panel:
+                if _is_act_break_panel:
+                    _act_pages_ctx = [
+                        p for p in script
+                        if str(p.get('act', '')) == str(page_script.get('act', '1'))
+                        and not p.get('_act_break')
+                    ]
+                    prompt = _build_act_break_prompt(
+                        page_script, project.story_dna, project.story_idea,
+                        arc_state, _act_pages_ctx,
+                    )
+                    logger.info(
+                        f"  [ActBreak] p{page_num}: using act-break title-card prompt "
+                        f"(Act {page_script.get('act', '1')})."
+                    )
+                elif _is_narr_panel:
                     prompt = compose_narration_background_prompt(
                         panel_script = panel_script,
                         page_script  = page_script,
@@ -20087,6 +20964,18 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
             # character panels add extra crowd suppression on top of the base.
             _panel_negative = _adaptive_negative_prompt(panel_script)
 
+            # ── Identity + expression scoring context for this panel ────────
+            # Solo-character only (see _character_face_ref docstring above for
+            # why two-character panels are skipped rather than guessed at).
+            _chars_here = [c for c in (panel_script.get('characters_in_frame') or []) if str(c).strip()]
+            _solo_char_name = str(_chars_here[0]).strip() if len(_chars_here) == 1 else ''
+            _identity_ref_for_panel = (
+                _character_face_ref.get(_solo_char_name) if _solo_char_name else None
+            )
+            _expected_emotion_bucket = _coarse_emotion_bucket(
+                str(panel_script.get('_arc_emotion', '') or panel_script.get('mood', '') or '')
+            )
+
             variant_records = []
             for v in range(_panel_variants):
                 # Use pre-built seed for this slot when available.
@@ -20124,9 +21013,13 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
                             enhanced,
                             expect_faces=bool(panel_script.get('characters_in_frame')),
                             palette_ref=_prev_panel_color_sig,
+                            identity_ref=_identity_ref_for_panel,
+                            expected_emotion_bucket=_expected_emotion_bucket,
                         )
+                        _face_desc = _bd.get('face_descriptor')
                     except Exception:
                         v_score = -1e9
+                        _face_desc = None
                     # Cheap dominant-colour signature (mean H,S,V + mean L) used
                     # by the page-level palette reconciliation below. Computed
                     # from the array already in memory — no extra I/O.
@@ -20144,6 +21037,7 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
                         'seed': seed,
                         'score': v_score,
                         'color_sig': _hue,
+                        '_face_descriptor': _face_desc,
                     })
                 except Exception as e:
                     logger.warning(f"  Panel {page_key}/{panel_key} variant {variant_num} failed: {e}")
@@ -20151,8 +21045,52 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
                     continue
             
             if not variant_records:
-                logger.warning(f"  All variants failed for {page_key}/{panel_key}")
-                continue
+                # ── Universal fallback safety net ──────────────────────────
+                # Every AI attempt for this panel raised (transient API/GPU
+                # error, OOM, a malformed prompt rejected by the model...).
+                # `continue`-ing here (the old behaviour) leaves NO manifest
+                # entry for this panel at all — script.json still lists the
+                # page, but there is nothing for compose_page to draw. For a
+                # normal story page the validator's detect_gaps() catches
+                # that as a "missing panel" and repairs it; for a special
+                # page (prologue / narration-splash / act-interstitial /
+                # act-break) detect_gaps deliberately does NOT repair it —
+                # it only logs a warning — so the book could ship with a
+                # narrative page that has no image and nothing flags it.
+                # Synthesizing a typeset placeholder here means the manifest
+                # always has SOME entry, sized correctly for the slot, so a
+                # transient failure degrades to "an obviously-placeholder
+                # card that's easy to spot and regenerate" instead of "a
+                # silently missing page that ships in the final book."
+                logger.warning(
+                    f"  All variants failed for {page_key}/{panel_key}; "
+                    f"inserting typeset fallback card so the page isn't left imageless."
+                )
+                try:
+                    _fallback_label = (
+                        page_script.get('title')
+                        or panel_script.get('description')
+                        or page_script.get('beat')
+                        or f"Page {final_page_num}"
+                    )
+                    fallback_img = _make_fallback_panel_image(
+                        gen_w, gen_h, str(_fallback_label), project.story_dna,
+                    )
+                    fname = f"{page_key}_{panel_key}_fallback.jpg"
+                    save_path = os.path.join(panels_dir, fname)
+                    fallback_img.save(save_path, format='JPEG',
+                                       quality=PRINT_PANEL_JPEG_QUALITY, optimize=True)
+                    variant_records.append({
+                        'index': 1, 'path': save_path, 'seed': 0,
+                        'score': -1e9, 'color_sig': None,
+                        '_is_fallback_placeholder': True,
+                    })
+                except Exception as _fb_e:
+                    logger.warning(
+                        f"  Fallback card generation ALSO failed for "
+                        f"{page_key}/{panel_key} ({_fb_e}); panel left without an image."
+                    )
+                    continue
 
             # Auto-select the highest-scoring variant as the one the reader sees.
             # Every variant was already generated, enhanced, and scored above
@@ -20168,21 +21106,43 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
                 f"(scores {_scores})"
             )
             # Carry this panel's chosen dominant colour forward so the NEXT
-            # panel's variant scoring favours palette continuity within the scene.
+            # panel's variant scoring favours palette continuity within the scene,
+            # and (for a solo-character panel) update that character's running
+            # face-identity reference from the WINNING face — an exponential
+            # blend so one odd panel can't yank the reference off-course, while
+            # still letting it drift gently with the art's natural evolution.
             try:
                 for _vr in variant_records:
                     if int(_vr.get('index', -1)) == int(best_variant):
                         _cs = _vr.get('color_sig')
                         if _cs:
                             _prev_panel_color_sig = _cs
+                        if _solo_char_name:
+                            _winning_desc = _vr.get('_face_descriptor')
+                            if _winning_desc is not None:
+                                _prior = _character_face_ref.get(_solo_char_name)
+                                _character_face_ref[_solo_char_name] = (
+                                    _winning_desc if _prior is None
+                                    else (0.7 * _prior + 0.3 * _winning_desc)
+                                )
                         break
             except Exception:
                 pass
+            # Strip the raw descriptor out of every variant record before it
+            # lands in the manifest — it's a numpy array, and the manifest is
+            # json.dump'd repeatedly through the rest of this pipeline.
+            for _vr in variant_records:
+                _vr.pop('_face_descriptor', None)
             manifest[page_key][panel_key] = {
                 'active_variant': best_variant,
                 'prompt': prompt,
                 'description': panel_script.get('description', ''),
                 'variants': variant_records,
+                # Flag so the editor / validator can surface this panel for a
+                # manual redo instead of it silently looking like real art.
+                '_needs_regeneration': any(
+                    v.get('_is_fallback_placeholder') for v in variant_records
+                ),
                 # Geometry metadata — stored so rebuild_from_manifest can
                 # regenerate at the same size without re-deriving from layout.
                 'true_panel_w': true_panel_w,
@@ -20196,6 +21156,90 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
                 # See build_panel_manifest_prompts for schema documentation.
                 'action_sequence': panel_script.get('_action_sequence') or '',
             }
+
+            # ── Ledger-checkable guard (always computed, no LLM call) ────────
+            # build_consistency_ledger() just joins state the pipeline already
+            # computed (see comic_book_visual_consistency.py) — it costs
+            # nothing to call regardless of VISION_CONSISTENCY_CHECK, so this
+            # guard runs even when the vision check itself is disabled. Any
+            # panel with a checkable fact (costume colour, screen side, a
+            # permanent marking, a held item) is exempted from the page-level
+            # hue-harmonisation pass below, because that pass has no way to
+            # know whether a hue-closer runner-up also has the right shirt
+            # colour — it could just as easily introduce the drift as fix it.
+            _ledger = None
+            try:
+                _screen_positions = getattr(scene_anchor, 'screen_positions', {}) or {}
+                _ledger = _vc.build_consistency_ledger(
+                    panel_script, panel_script.get('characters_in_frame'),
+                    _screen_positions,
+                )
+                if _vc.is_ledger_checkable(_ledger):
+                    _ledger_protected_panel_keys.add(panel_key)
+            except Exception as _ledger_e:
+                logger.debug(
+                    f"  [VisualConsistency] Ledger guard skipped for "
+                    f"{page_key}/{panel_key} ({_ledger_e})."
+                )
+                _ledger = None
+
+            # ── Sparse vision-LLM consistency verification ──────────────────
+            # One extra call per panel that has checkable state (costume
+            # colour, screen side, a permanent marking, a held item, or an
+            # expected emotion) — not per variant, so cost is bounded by panel
+            # count, not by panels × variants. This is the "detective" layer:
+            # everything else in this pipeline writes a better prompt and
+            # trusts the diffusion model obeyed it; this actually looks at
+            # the rendered pixels. See comic_book_visual_consistency.py.
+            if VISION_CONSISTENCY_CHECK:
+                try:
+                    if _ledger is not None and _vc.is_ledger_checkable(_ledger):
+                        import novel_generator as _ng_vision
+                        _vision_fn = lambda p, u: _ng_vision.get_vision_prompt_response(
+                            p, u, use_grok=USE_GROK)
+                        _winner_path = next(
+                            (v.get('path') for v in variant_records
+                             if int(v.get('index', -1)) == int(best_variant)), None)
+                        if _winner_path and os.path.exists(_winner_path):
+                            _winner_img = Image.open(_winner_path).convert('RGB')
+                            _vc_result = _vc.check_variant_against_ledger(
+                                _winner_img, _ledger, _vision_fn,
+                                parse_json=parse_json_response,
+                            )
+                            if _vc_result.checked:
+                                logger.info(
+                                    f"  [VisualConsistency] {page_key}/{panel_key}: "
+                                    f"{_vc_result.summary()}"
+                                )
+                                if _vc_result.score < VISION_CONSISTENCY_REGEN_THRESHOLD:
+                                    # Try the next-best CHEAP-scored variant
+                                    # instead — it already exists, costs
+                                    # nothing extra to switch to, and may
+                                    # simply not share the same drift.
+                                    _runner_up = sorted(
+                                        (v for v in variant_records
+                                         if int(v.get('index', -1)) != int(best_variant)),
+                                        key=lambda v: v.get('score', -1e9), reverse=True,
+                                    )
+                                    if _runner_up:
+                                        _new_best = int(_runner_up[0]['index'])
+                                        logger.warning(
+                                            f"  [VisualConsistency] {page_key}/{panel_key}: "
+                                            f"best variant failed consistency check "
+                                            f"({'; '.join(_vc_result.mismatches[:3])}); "
+                                            f"switching active_variant {best_variant} -> {_new_best}."
+                                        )
+                                        manifest[page_key][panel_key]['active_variant'] = _new_best
+                                    else:
+                                        manifest[page_key][panel_key]['_needs_regeneration'] = True
+                                        logger.warning(
+                                            f"  [VisualConsistency] {page_key}/{panel_key}: "
+                                            f"only variant failed consistency check "
+                                            f"({'; '.join(_vc_result.mismatches[:3])}); "
+                                            f"flagged for manual regeneration."
+                                        )
+                except Exception as _vc_e:
+                    logger.debug(f"  [VisualConsistency] Check skipped for {page_key}/{panel_key} ({_vc_e}).")
 
             # --- Advance continuity trackers ---
             panel_summary = _summarize_panel(panel_script)
@@ -20224,7 +21268,9 @@ def generate_panel_images(project: ComicBookProject, script: List[Dict],
         try:
             _pg_entry = manifest.get(page_key, {})
             if _pg_entry.get('_page_type', 'story') == 'story':
-                _reharmonised = _reconcile_page_palette(_pg_entry)
+                _reharmonised = _reconcile_page_palette(
+                    _pg_entry, protected_panel_keys=_ledger_protected_panel_keys,
+                )
                 if _reharmonised:
                     logger.debug(
                         f"  {page_key}: palette reconciliation re-selected "
@@ -21941,6 +22987,100 @@ def _panel_is_intentionally_silent(panel: Dict) -> bool:
     return dd == 'none'
 
 
+def enforce_emotional_silence(
+    script: List[Dict],
+    emotional_arc: Dict,
+    silence_target_frac: float = 0.15,
+    high_intensity_threshold: float = 0.75,
+) -> int:
+    """Convert a bounded share of high-intensity pages' weakest dialogue
+    panel into a deliberate silent beat.
+
+    Comics lean on a wordless reaction panel right after a gut-punch — the
+    silence itself carries the weight. Nothing in this pipeline previously
+    INSERTED that silence; _panel_is_intentionally_silent only recognises it
+    after the fact. This pass is conservative by design: a panel is only a
+    candidate if its existing dialogue is already minimal filler (empty, or
+    a single short interjection of ≤4 words) — it never deletes substantial
+    or plot-carrying lines, so it cannot lose story information. What it DOES
+    do is stop a weak one-word line from occupying a beat that would read far
+    stronger silent, and correctly tags the result (dialogue_density='none')
+    so downstream coverage auditing recognises it as a deliberate choice, not
+    a gap.
+
+    Capped at `silence_target_frac` of eligible high-intensity pages so the
+    book doesn't over-silence — most high-intensity beats should keep their
+    dialogue; this only claims the ones that were barely using it anyway.
+
+    Returns the number of panels converted. Pure/deterministic, no LLM.
+    """
+    if not script or not emotional_arc:
+        return 0
+
+    eligible: List[Tuple[Dict, Dict]] = []   # (page, candidate_panel)
+    for page in script:
+        if not isinstance(page, dict) or page.get('_act_break') or page.get('_prologue'):
+            continue
+        panels = [p for p in (page.get('panels') or []) if isinstance(p, dict)]
+        if len(panels) < 2:
+            continue   # never silence the only panel on a page
+        pnum = page.get('page')
+        arc_state = emotional_arc.get(pnum, {}) if isinstance(emotional_arc, dict) else {}
+        try:
+            intensity = float(arc_state.get('intensity', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if intensity < high_intensity_threshold:
+            continue
+        if all(_panel_is_intentionally_silent(p) for p in panels):
+            continue   # page is already entirely quiet
+
+        # Prefer the LAST panel (the held reaction beat lands best after the
+        # turn, not before it) among those whose dialogue is already minimal
+        # filler and that aren't already silent.
+        candidate = None
+        for p in reversed(panels):
+            if _panel_is_intentionally_silent(p):
+                continue
+            dlg = p.get('dialogue') or []
+            texts = [str(d.get('text', '')).strip() for d in dlg if isinstance(d, dict)]
+            texts = [t for t in texts if t]
+            total_words = sum(len(t.split()) for t in texts)
+            if not texts or (len(texts) == 1 and total_words <= 4):
+                candidate = p
+                break
+        if candidate is not None:
+            eligible.append((page, candidate))
+
+    if not eligible:
+        return 0
+
+    target_n = max(0, int(round(len(eligible) * silence_target_frac)))
+    if target_n == 0:
+        return 0
+
+    # Spread selections across the book rather than clustering at the start —
+    # evenly sample the eligible list.
+    if target_n < len(eligible):
+        step = len(eligible) / float(target_n)
+        chosen_idx = {int(i * step) for i in range(target_n)}
+        chosen = [eligible[i] for i in sorted(chosen_idx) if i < len(eligible)]
+    else:
+        chosen = eligible
+
+    converted = 0
+    for page, panel in chosen:
+        panel['dialogue'] = []
+        panel['dialogue_density'] = 'none'
+        panel['_silent_beat_inserted'] = True
+        converted += 1
+        logger.info(
+            f"  [Silence] p{page.get('page','?')}: converted a minimal-dialogue "
+            f"panel into a deliberate silent beat (high-intensity page)."
+        )
+    return converted
+
+
 def audit_dialogue_coverage(script: List[Dict],
                              label: str = '') -> Dict[str, Dict]:
     """Measure dialogue/narration coverage per act; log a summary table.
@@ -22783,7 +23923,6 @@ def _build_character_voice_guide(graph, act_pages: List[Dict],
 
     return '\n'.join(lines) if lines else "  (no voice profiles matched speakers in this act)"
 
-
 def _review_act_dialog(
     act_number: int,
     act_pages: List[Dict],
@@ -22794,148 +23933,101 @@ def _review_act_dialog(
     characters: List = None,
     voice_profiles: Dict = None,
 ) -> Dict[str, List[Dict]]:
-    """Run the dialog reviewer LLM for one act.
-
-    Returns a dict keyed by "page_{N}_panel_{M}" → revised dialogue list,
-    e.g.:
-        {
-          "page_12_panel_2": [
-            {"speaker": "Yuki", "text": "...", "bubble_type": "speech",
-             "speaker_side": "left"},
-            ...
-          ],
-          ...
-        }
-
-    Only panels where dialogue was changed are included — panels with no
-    suggested revision are omitted so the caller can do a targeted update.
-    """
-    act_roman = {'1':'I','2':'II','3':'III','4':'IV','5':'V'}.get(
-        str(act_number), str(act_number))
-
-    genre  = getattr(story_idea, 'genre', 'graphic novel')
-    mood   = getattr(story_idea, 'mood', '')
+    """Run the dialog reviewer LLM for one act."""
+    act_roman = {
+        '1': 'I', '2': 'II', '3': 'III', '4': 'IV', '5': 'V',
+        '6': 'VI', '7': 'VII', '8': 'VIII', '9': 'IX', '10': 'X',
+        '11': 'XI', '12': 'XII', '13': 'XIII', '14': 'XIV', '15': 'XV',
+        '16': 'XVI', '17': 'XVII', '18': 'XVIII', '19': 'XIX', '20': 'XX'
+    }.get(str(act_number), str(act_number))
+   
+    genre = getattr(story_idea, 'genre', 'graphic novel')
+    mood = getattr(story_idea, 'mood', '')
     premise = getattr(story_idea, 'premise', '')[:300]
-    themes  = ', '.join((getattr(story_idea, 'themes', None) or [])[:4])
-
-    act_context   = _build_act_dialog_context(act_pages, graph, emotional_arc)
-    voice_guide   = _build_character_voice_guide(graph, act_pages, characters=characters)
+    themes = ', '.join((getattr(story_idea, 'themes', None) or [])[:4])
+    act_context = _build_act_dialog_context(act_pages, graph, emotional_arc)
+    voice_guide = _build_character_voice_guide(graph, act_pages, characters=characters)
     subtext_block = _build_relationship_subtext_block(graph, act_pages)
-    wisdom_block  = _build_wisdom_spice_block(act_pages, graph)
-    arc_summary   = story_dna.get('mood_thread', '') or mood
+    wisdom_block = _build_wisdom_spice_block(act_pages, graph)
+    arc_summary = story_dna.get('mood_thread', '') or mood
 
-    # Richer voice + emotional-delivery guidance: who each speaker is (origin,
-    # accent, heritage, signature lexicon) and how they should SOUND in each
-    # emotional register (shout / drunk slur / seductive / scared stammer / …).
-    # Both fall back to '' cleanly when no profiles were built.
-    _act_speakers = sorted({
-        (d.get('speaker') or '').strip()
-        for pg in act_pages for panel in (pg.get('panels') or [])
-        for d in (panel.get('dialogue') or [])
-        if (d.get('speaker') or '').strip()
-        and (d.get('speaker') or '').strip().upper() != 'NARRATOR'
-    } | {
-        str(c).strip()
-        for pg in act_pages for panel in (pg.get('panels') or [])
-        for c in (panel.get('characters_in_frame') or []) if str(c).strip()
-    })
-    _voice_profile_block = voice_profile_guide(voice_profiles or {}, _act_speakers)
-    _delivery_block = delivery_guidance_block()
+# === EROTIC INTENSITY GUIDANCE ===
+    erotic_level = "neutral"
+    if act_pages:
+        erotic_level = _erotic_intensity(act_pages[0])
+    erotic_guidance = ""
+    if erotic_level != "neutral":
+        erotic_guidance = f"""
+THIS ACT CONTAINS EROTIC CONTENT ({erotic_level.upper()}).
 
-    # Dramatic-craft technique for this act's dominant emotion — the writing
-    # analogue of the art-technique flourish. Pick the act's most common arc
-    # emotion, route it to a scene-craft device, and brief the reviewer to lean
-    # the whole act's dialogue into that technique.
-    _emo_counts: Dict[str, int] = {}
-    for pg in act_pages:
-        pn = pg.get('page')
-        st = (emotional_arc or {}).get(pn, {}) if isinstance(emotional_arc, dict) else {}
-        ke = str(st.get('key_emotion', '') or '').strip().lower()
-        if not ke:
-            ke = str(pg.get('emotional_tone', '') or '').strip().lower()
-        if ke:
-            _emo_counts[ke] = _emo_counts.get(ke, 0) + 1
-    _dominant_emo = (max(_emo_counts, key=_emo_counts.get) if _emo_counts
-                     else str(mood or ''))
-    _drama_tech = _dramatic_technique_for(_dominant_emo, act_number)
-    _drama_block = (
-        f"SCENE-CRAFT TECHNIQUE FOR THIS ACT (its dominant register is "
-        f"'{_dominant_emo}'): {_drama_tech}\n"
-        f"Apply this as the act's guiding dialogue craft where it fits — it is "
-        f"the writing equivalent of choosing a lighting style for the art.\n\n"
-        if _drama_tech else ""
-    )
-    _trait_block = trait_voice_amplifier_block(characters or [])
-    _trait_block = (_trait_block + "\n\n") if _trait_block else ""
+WRITE RAW, PASSIONATE, HIGHLY EXPLICIT DIRTY DIALOGUE:
 
-    # Genre voice register — the dialogue directive from the book's genre lens,
-    # so the whole cast speaks in the tradition (noir obliqueness, mythic
-    # cadence, screwball momentum) on top of their individual voices.
-    _genre_lens = story_dna.get('_genre_lens') or {}
-    _genre_voice = _genre_lens.get('dialogue', '')
-    _genre_block = (
-        f"GENRE VOICE REGISTER ({_genre_lens.get('_genre', '')}): {_genre_voice}\n\n"
-        if _genre_voice else ""
-    )
+- Be vivid and sensual: describe bodies, sensations, wetness, hardness, taste, heat, and overwhelming desire.
+- Use strong, graphic language: cock, pussy, tits, ass, clit, cum, fuck, suck, breed, swallow, throb, drip, moan, beg, pound, fill, stretch, etc.
+- Flirting/Foreplay: teasing compliments, building anticipation ("I want to taste you", "You're so wet for me", "Let me feel how hard you are").
+- Sex: explicit acts, commands, begging, dirty praise ("Fuck me harder", "Your cock feels so good inside me", "Cum on my tits", "Swallow every drop", "Breed me", "I'm your slut").
+- Emotional + Physical: mix raw lust with passion, love, dominance, or vulnerability ("I need you", "You're mine", "Don't stop, I’m so close").
+- Scale by intensity:
+  - Flirty: playful teasing and compliments
+  - Seductive: very graphic body worship and offers
+  - Hardcore: raw, pornographic, dominant/submissive language
 
+Make the reader feel the heat, desire, urgency, and emotional connection. Never be tame, vague, or fade-to-black in NSFW beats. The language should be spicy, immersive, and character-driven.
+"""
+    # =========================================
 
-    # ══ STABLE PREFIX — identical for every act of this book, so xAI serves
-    # it from the prompt cache after the first act instead of re-billing the
-    # entire craft-rules brief once per act. Only this act's script, voices,
-    # arc, and subtext vary, and they trail in the tail below. act_roman is kept
-    # OUT of these rules (genericised) so the prefix stays byte-identical.
     prompt = (
         "You are a senior comics editor reviewing the dialogue for one act of "
         "a graphic novel. You have TWO jobs:\n\n"
         "JOB 1 — FILL MISSING DIALOGUE (highest priority)\n"
-        "  Panels marked '(no dialogue)' that contain characters are GAPS, not "
+        " Panels marked '(no dialogue)' that contain characters are GAPS, not "
         "deliberate silences. Fill them. Every character panel needs a voice.\n"
-        "  Rules for filling empty panels:\n"
-        "  - Character alone, reacting, or observing -> add a THOUGHT bubble "
+        " Rules for filling empty panels:\n"
+        " - Character alone, reacting, or observing -> add a THOUGHT bubble "
         "(bubble_type: thought, speaker: character name). Under 10 words of inner monologue.\n"
-        "  - Scene-opening / location-establishing panels with no figures -> add a "
+        " - Scene-opening / location-establishing panels with no figures -> add a "
         "NARRATOR caption (speaker: NARRATOR, bubble_type: caption). Under 12 words "
         "grounding the reader in time, place, or thematic stakes.\n"
-        "  - The act-opening panel (the first panel of the act) -> ALWAYS add a "
+        " - The act-opening panel (the first panel of the act) -> ALWAYS add a "
         "NARRATOR caption if one is absent. This is the reader's orientation beat.\n"
-        "  - Two characters present, no speech -> add 1-2 short speech or whisper "
+        " - Two characters present, no speech -> add 1-2 short speech or whisper "
         "lines that reveal tension, history, or subtext between them.\n"
-        "  - Pure action panel (explosion, chase, impact, no characters) -> may stay "
+        " - Pure action panel (explosion, chase, impact, no characters) -> may stay "
         "silent; add NARRATOR caption only if it serves dramatic momentum.\n"
-        "  - Cosmic / astronomical panel (no human figures) -> add NARRATOR caption "
+        " - Cosmic / astronomical panel (no human figures) -> add NARRATOR caption "
         "(speaker: NARRATOR, bubble_type: caption) with thematic or scale narration. "
         "The cosmos does not speak, but the narrator can.\n"
-        "  - SCENE TRANSITION panels (tagged in the script below) -> ADD an "
+        " - SCENE TRANSITION panels (tagged in the script below) -> ADD an "
         "orienting NARRATOR caption naming the new place, the time elapsed, or "
         "a 'Meanwhile...' pivot — KEEPING any dialogue already there. Readers "
         "re-anchor at every scene cut; a missing transition caption is the "
         "single most disorienting narration gap in comics.\n\n"
         "JOB 2 — IMPROVE EXISTING DIALOGUE\n"
-        "  For panels that already have lines, revise to improve:\n"
-        "  1. VOICE DISTINCTIVENESS -- each character must sound unique; a reader\n"
-        "     should identify the speaker with the name label covered. Honour each\n"
-        "     character's dialect, cadence, vocabulary register, verbal tics, and\n"
-        "     catchphrases from the voice guide below.\n"
-        "  2. RHYTHM & CADENCE -- mimic natural speech by alternating short, punchy\n"
-        "     statements with longer, more complex clauses. Uniform line lengths read\n"
-        "     flat; the contrast between a clipped line and a winding one creates energy.\n"
-        "  3. VOICE, ACCENT & DELIVERY -- write each line the way THIS person\n"
-        "     actually sounds: their regional/cultural accent and idiom (through\n"
-        "     authentic word choice, rhythm, and a few signature terms), AND the\n"
-        "     emotional delivery of the moment (an angry character SHOUTS, a drunk\n"
-        "     one slurs, a delighted one bubbles over, a seducer purrs, a terrified\n"
-        "     one stammers). Light, READABLE accent/slur markers are welcome where\n"
-        "     they define the voice -- never heavy phonetic caricature or stereotype.\n"
-        "  4. PRECISION, NO FLUFF -- max 15 words per bubble; every word earns its place.\n"
-        "  5. SUBTEXT -- replace on-the-nose lines with oblique, charged alternatives.\n"
-        "  6. HUMOR THAT OBSERVES -- wit aimed at human foolishness lands harder than wordplay.\n"
-        "  7. DRAMATIC TENSION -- raise stakes in flat exchanges; create unspoken conflict.\n"
-        "  8. SHOW DON'T TELL -- cut captions that restate what the panel already shows.\n"
-        "  9. EMOTIONAL TRUTH -- deepen character feeling, not just plot movement.\n"
-        "  10. SERVE THE SCENE ENGINE -- where a page shows a SCENE ENGINE, make the\n"
-        "      exchange visibly pursue that objective against its opposition and move\n"
-        "      the scene across its turn, through the given tactics. Cut any line\n"
-        "      that doesn't push the want, resist it, or shift the value.\n\n"
+        " For panels that already have lines, revise to improve:\n"
+        " 1. VOICE DISTINCTIVENESS -- each character must sound unique; a reader\n"
+        " should identify the speaker with the name label covered. Honour each\n"
+        " character's dialect, cadence, vocabulary register, verbal tics, and\n"
+        " catchphrases from the voice guide below.\n"
+        " 2. RHYTHM & CADENCE -- mimic natural speech by alternating short, punchy\n"
+        " statements with longer, more complex clauses. Uniform line lengths read\n"
+        " flat; the contrast between a clipped line and a winding one creates energy.\n"
+        " 3. VOICE, ACCENT & DELIVERY -- write each line the way THIS person\n"
+        " actually sounds: their regional/cultural accent and idiom (through\n"
+        " authentic word choice, rhythm, and a few signature terms), AND the\n"
+        " emotional delivery of the moment (an angry character SHOUTS, a drunk\n"
+        " one slurs, a delighted one bubbles over, a seducer purrs, a terrified\n"
+        " one stammers). Light, READABLE accent/slur markers are welcome where\n"
+        " they define the voice -- never heavy phonetic caricature or stereotype.\n"
+        " 4. PRECISION, NO FLUFF -- max 15 words per bubble; every word earns its place.\n"
+        " 5. SUBTEXT -- replace on-the-nose lines with oblique, charged alternatives.\n"
+        " 6. HUMOR THAT OBSERVES -- wit aimed at human foolishness lands harder than wordplay.\n"
+        " 7. DRAMATIC TENSION -- raise stakes in flat exchanges; create unspoken conflict.\n"
+        " 8. SHOW DON'T TELL -- cut captions that restate what the panel already shows.\n"
+        " 9. EMOTIONAL TRUTH -- deepen character feeling, not just plot movement.\n"
+        " 10. SERVE THE SCENE ENGINE -- where a page shows a SCENE ENGINE, make the\n"
+        " exchange visibly pursue that objective against its opposition and move\n"
+        " the scene across its turn, through the given tactics. Cut any line\n"
+        " that doesn't push the want, resist it, or shift the value.\n\n"
         f"STORY: {genre} | {mood}\n"
         f"PREMISE: {premise}\n"
         f"THEMES: {themes}\n\n"
@@ -22945,13 +24037,13 @@ def _review_act_dialog(
         + _trait_block
         + "DIALOGUE RHYTHM FOLLOWS THE EMOTIONAL CURVE (each page header shows "
         "intensity 0-1 and stage):\n"
-        "  - peak / high intensity (>0.75): TERSE. Fragments. Single words. "
+        " - peak / high intensity (>0.75): TERSE. Fragments. Single words. "
         "The body is doing the talking; words are shrapnel.\n"
-        "  - rising / turn (0.4-0.75): clipped exchanges, interruptions, "
+        " - rising / turn (0.4-0.75): clipped exchanges, interruptions, "
         "lines that step on each other.\n"
-        "  - breath / setup / resolution (<0.4): characters can finish their "
+        " - breath / setup / resolution (<0.4): characters can finish their "
         "thoughts; longer, reflective lines; humour and tenderness live here.\n"
-        "  A page's dialogue LENGTH and SHAPE should make its intensity "
+        " A page's dialogue LENGTH and SHAPE should make its intensity "
         "readable even with the art covered.\n\n"
         "EMPATHY THROUGH INTERIORITY: at the emotional high points and turns of "
         "the act, give the focal character a brief THOUGHT caption that reveals "
@@ -22968,26 +24060,26 @@ def _review_act_dialog(
         "reveal half-spoken. NEVER end a hook page on a settled, complete "
         "statement.\n\n"
         "INSTRUCTIONS:\n"
-        "  - FILLING: include every panel marked '(no dialogue)' that has characters "
+        " - FILLING: include every panel marked '(no dialogue)' that has characters "
         "or is an establishing/cosmic shot. Write at least one line for each.\n"
-        "  - FILLING: for character panels, default to thought (inner monologue) when "
+        " - FILLING: for character panels, default to thought (inner monologue) when "
         "in doubt -- silence in a character panel is almost always wrong.\n"
-        "  - FILLING: keep fills SHORT (12 words or fewer) -- you are adding a missing "
+        " - FILLING: keep fills SHORT (12 words or fewer) -- you are adding a missing "
         "voice, not writing a monologue.\n"
-        "  - REVISING: only revise existing panels where improvement is meaningful.\n"
-        "  - REVISING: do NOT add new SPEECH lines to panels that already have "
+        " - REVISING: only revise existing panels where improvement is meaningful.\n"
+        " - REVISING: do NOT add new SPEECH lines to panels that already have "
         "dialogue -- only rewrite existing lines. EXCEPTION: adding a NARRATOR "
         "caption to a scene-transition panel is always allowed (and required "
         "when tagged), regardless of existing dialogue.\n"
-        "  - REVISING: keep bubble_type unchanged unless a change genuinely improves "
+        " - REVISING: keep bubble_type unchanged unless a change genuinely improves "
         "the moment.\n"
-        "  - REVISING: preserve speaker_side values.\n\n"
+        " - REVISING: preserve speaker_side values.\n\n"
         "Return ONLY a JSON object. Keys are \"page_{N}_panel_{M}\" "
         "(N and M taken from the act's script below). Value is the COMPLETE dialogue array for "
         "that panel (all existing lines plus any new ones you added). "
         "Give every character line a \"delivery\" field (one of: shout, angry, "
         "excited, happy, drunk, seductive, tender, scared, sad, sarcastic, cold, "
-        "whisper, commanding, neutral) and set bubble_type to match. "
+        "whisper, commanding, neutral, hardcore) and set bubble_type to match. "
         "Omit panels you are not changing at all.\n\n"
         "{\"page_12_panel_2\": ["
         "{\"speaker\": \"NARRATOR\", \"text\": \"Three weeks later...\", "
@@ -23005,30 +24097,24 @@ def _review_act_dialog(
         + (f"{subtext_block}\n\n" if subtext_block else "")
         + (wisdom_block if wisdom_block else "")
         + f"ACT {act_roman} -- CURRENT SCRIPT:\n{act_context}\n\n"
+        + f"{erotic_guidance}\n\n"   # ← EROTIC GUIDANCE ADDED HERE
         + f"Review Act {act_roman} now, applying JOB 1, JOB 2, and every rule "
         "above. Return ONLY the JSON object described above (keys "
         "\"page_N_panel_M\", values the complete dialogue array), omitting any "
         "panel you are not changing."
     )
-
-
     raw = get_openai_prompt_response(
         prompt,
-        temperature=0.72,
-        # Raised from 8000 → 16000: the reviewer now also fills empty panels
-        # (NARRATOR captions, thought bubbles) in addition to revising existing
-        # lines, so a full act with many silent panels can produce substantially
-        # more output than a pure revision pass.
+        temperature=0.85 if erotic_level != "neutral" else 0.72,
         max_completion_tokens=16000,
         openai_model=openai_model_large,
         use_grok=USE_GROK,
     )
     parsed = parse_json_response(raw)
     if not parsed or not isinstance(parsed, dict):
-        logger.warning(f"  [Dialog Review] Act {act_roman}: no valid JSON returned.")
+        logger.warning(f" [Dialog Review] Act {act_roman}: no valid JSON returned.")
         return {}
     return parsed
-
 
 def _apply_dialog_revisions(script: List[Dict],
                              revisions: Dict[str, List[Dict]]) -> Tuple[int, int]:
@@ -23228,31 +24314,25 @@ def dialogue_cover_test(script: List[Dict], voice_profiles: Dict,
     }
     return report
 
-
 def review_and_enhance_dialog(
     script: List[Dict],
     project: 'ComicBookProject',
     emotional_arc: Dict,
 ) -> Tuple[List[Dict], Dict]:
     """Run the per-act dialog review pass and apply revisions to the script.
-
     Loops over each act in the script, calls the LLM reviewer for that act's
     pages (text-only — no images), applies any suggested revisions back into
     the script in-place, then saves a dialog_revisions.json sidecar so the
     originals can be inspected.
-
     Returns:
         (revised_script, all_revisions_dict)
-
     The all_revisions_dict is also saved to:
         {working_dir}/dialog_revisions.json
     """
     logger.info("[6.5/8] Dialog review & enhancement pass (per act)...")
-
-    graph        = project.character_graph
-    story_idea   = project.story_idea
-    story_dna    = project.story_dna
-
+    graph = project.character_graph
+    story_idea = project.story_idea
+    story_dna = project.story_dna
     # Build (once) the per-character voice profiles — origin, accent, heritage,
     # signature lexicon — that let the reviewer write each line in the speaker's
     # real voice. Cached on the project so a later rebuild/enhance reuses them.
@@ -23265,9 +24345,8 @@ def review_and_enhance_dialog(
             )
             project.voice_profiles = voice_profiles
         except Exception as _vp_e:
-            logger.warning(f"  [Voice] Profile build skipped ({_vp_e}).")
+            logger.warning(f" [Voice] Profile build skipped ({_vp_e}).")
             voice_profiles = {}
-
     # Group pages by act number (skip act-break cards)
     acts: Dict[str, List[Dict]] = {}
     for pg in script:
@@ -23275,18 +24354,33 @@ def review_and_enhance_dialog(
             continue
         act_key = str(pg.get('act', '1'))
         acts.setdefault(act_key, []).append(pg)
-
     all_revisions: Dict[str, Dict] = {}
     total_pages = total_panels = 0
-
+   
     for act_key in sorted(acts.keys()):
         act_pages = acts[act_key]
-        act_roman = {'1':'I','2':'II','3':'III','4':'IV','5':'V'}.get(
-            act_key, act_key)
+        act_roman = {
+            '1': 'I', '2': 'II', '3': 'III', '4': 'IV', '5': 'V',
+            '6': 'VI', '7': 'VII', '8': 'VIII', '9': 'IX', '10': 'X',
+            '11': 'XI', '12': 'XII', '13': 'XIII', '14': 'XIV', '15': 'XV',
+            '16': 'XVI', '17': 'XVII', '18': 'XVIII', '19': 'XIX', '20': 'XX'
+        }.get(act_key, act_key)
         logger.info(
-            f"  [Dialog Review] Act {act_roman}: reviewing "
+            f" [Dialog Review] Act {act_roman}: reviewing "
             f"{len(act_pages)} page(s)..."
         )
+        
+        # === EROTIC INTENSITY GUIDANCE (NEW) ===
+        erotic_level = "neutral"
+        if act_pages:
+            erotic_level = _erotic_intensity(act_pages[0])
+        erotic_guidance = ""
+        if erotic_level != "neutral":
+            erotic_guidance = f"\n\nTHIS ACT CONTAINS EROTIC CONTENT ({erotic_level.upper()}). " \
+                              "Use strong, graphic, passionate dirty talk scaled to this intensity. " \
+                              "Be explicit with body compliments and sexual offers, highlight sexuality, sensuality, passionate sex, emotional connection with reader, spicy NSFW content."
+        # =======================================
+        
         try:
             revisions = _review_act_dialog(
                 int(act_key), act_pages,
@@ -23296,24 +24390,22 @@ def review_and_enhance_dialog(
             )
         except Exception as e:
             logger.warning(
-                f"  [Dialog Review] Act {act_roman} reviewer call failed: {e}"
+                f" [Dialog Review] Act {act_roman} reviewer call failed: {e}"
             )
             revisions = {}
-
         if revisions:
             all_revisions[f"act_{act_key}"] = revisions
             pages_ch, panels_ch = _apply_dialog_revisions(script, revisions)
-            total_pages  += pages_ch
+            total_pages += pages_ch
             total_panels += panels_ch
             logger.info(
-                f"  [Dialog Review] Act {act_roman}: "
+                f" [Dialog Review] Act {act_roman}: "
                 f"{panels_ch} panel(s) revised across {pages_ch} page(s)."
             )
         else:
             logger.info(
-                f"  [Dialog Review] Act {act_roman}: no revisions suggested."
+                f" [Dialog Review] Act {act_roman}: no revisions suggested."
             )
-
     # ── Coverage audit + one targeted retry for sparse acts ──────────────
     # The reviewer can omit tagged panels from its JSON under token pressure
     # across a long act. Audit what actually landed; acts below the voice-
@@ -23334,7 +24426,7 @@ def review_and_enhance_dialog(
             act_roman = {'1':'I','2':'II','3':'III','4':'IV','5':'V'}.get(
                 act_key, act_key)
             logger.info(
-                f"  [Dialog Review] Act {act_roman} below coverage floor — "
+                f" [Dialog Review] Act {act_roman} below coverage floor — "
                 f"running one targeted retry..."
             )
             try:
@@ -23346,22 +24438,21 @@ def review_and_enhance_dialog(
                 )
             except Exception as e:
                 logger.warning(
-                    f"  [Dialog Review] Act {act_roman} retry failed: {e}")
+                    f" [Dialog Review] Act {act_roman} retry failed: {e}")
                 retry_rev = {}
             if retry_rev:
                 all_revisions[f"act_{act_key}_retry"] = retry_rev
                 p_ch, n_ch = _apply_dialog_revisions(script, retry_rev)
-                total_pages  += p_ch
+                total_pages += p_ch
                 total_panels += n_ch
                 logger.info(
-                    f"  [Dialog Review] Act {act_roman} retry: "
+                    f" [Dialog Review] Act {act_roman} retry: "
                     f"{n_ch} panel(s) filled/revised."
                 )
         if sparse_acts:
             audit_dialogue_coverage(script, label='post-retry')
     except Exception as _audit_err:
-        logger.warning(f"  [Dialogue audit] skipped ({_audit_err}).")
-
+        logger.warning(f" [Dialogue audit] skipped ({_audit_err}).")
     # Deterministic delivery enforcement: make a shout LOOK like a shout
     # (UPPER-CASE + burst bubble), sync every emotional line to the matching
     # bubble shape, and record each line's resolved delivery. Safe and
@@ -23370,10 +24461,9 @@ def review_and_enhance_dialog(
     try:
         _n_deliv = apply_dialogue_delivery(script, voice_profiles)
         if _n_deliv:
-            logger.info(f"  [Delivery] Enforced delivery on {_n_deliv} line(s).")
+            logger.info(f" [Delivery] Enforced delivery on {_n_deliv} line(s).")
     except Exception as _de:
-        logger.warning(f"  [Delivery] Enforcement skipped ({_de}).")
-
+        logger.warning(f" [Delivery] Enforcement skipped ({_de}).")
     # ── Cover-test quality gate (recommendation C) ────────────────────────────
     # Measure whether each character's voice is distinct enough that a reader
     # could attribute lines with the speaker labels hidden. Characters that fail
@@ -23389,14 +24479,14 @@ def review_and_enhance_dialog(
         )
         if cover_report.get('pages_tested'):
             logger.info(
-                "  [CoverTest] Voice distinctness: overall %.0f%% "
+                " [CoverTest] Voice distinctness: overall %.0f%% "
                 "(%d page(s) tested).",
                 100 * cover_report.get('overall_accuracy', 0.0),
                 cover_report['pages_tested'],
             )
             for _n in cover_report.get('flagged', []):
                 _acc = cover_report['per_character'][_n]['accuracy']
-                logger.info("    weak voice: %s (%.0f%% attributable)", _n, 100 * _acc)
+                logger.info(" weak voice: %s (%.0f%% attributable)", _n, 100 * _acc)
         flagged = cover_report.get('flagged', [])
         if flagged:
             # Which acts do the flagged characters speak in? Re-review those only.
@@ -23409,10 +24499,10 @@ def review_and_enhance_dialog(
                             sp = str((d or {}).get('speaker', '') or '').strip().lower()
                             if sp in flagged_l:
                                 acts_to_fix.add(act_key)
-            acts_to_fix = sorted(acts_to_fix)[:3]   # cap the extra work
+            acts_to_fix = sorted(acts_to_fix)[:3] # cap the extra work
             if acts_to_fix:
                 logger.info(
-                    "  [CoverTest] Re-reviewing act(s) %s to sharpen %d weak "
+                    " [CoverTest] Re-reviewing act(s) %s to sharpen %d weak "
                     "voice(s): %s", acts_to_fix, len(flagged), ', '.join(flagged),
                 )
             for act_key in acts_to_fix:
@@ -23430,7 +24520,7 @@ def review_and_enhance_dialog(
                     if revs:
                         _apply_dialog_revisions(script, revs)
                 except Exception as _ct_e:
-                    logger.warning(f"  [CoverTest] Re-review of act {act_key} "
+                    logger.warning(f" [CoverTest] Re-review of act {act_key} "
                                    f"skipped ({_ct_e}).")
             # Re-sync delivery after any re-review edits.
             try:
@@ -23438,13 +24528,11 @@ def review_and_enhance_dialog(
             except Exception:
                 pass
     except Exception as _ct:
-        logger.warning(f"  [CoverTest] Gate skipped ({_ct}).")
-
+        logger.warning(f" [CoverTest] Gate skipped ({_ct}).")
     # Save sidecar so originals can be diffed / inspected
     revisions_path = os.path.join(project.working_dir, "dialog_revisions.json")
     with open(revisions_path, 'w', encoding='utf-8') as f:
         json.dump(all_revisions, f, indent=2, ensure_ascii=False)
-
     # Save the cover-test report alongside, for human inspection.
     try:
         if cover_report:
@@ -23453,13 +24541,11 @@ def review_and_enhance_dialog(
                 json.dump(cover_report, f, indent=2, ensure_ascii=False)
     except Exception:
         pass
-
     logger.info(
-        f"  [Dialog Review] Complete: {total_panels} panel(s) revised across "
+        f" [Dialog Review] Complete: {total_panels} panel(s) revised across "
         f"{total_pages} page(s) total. Revisions saved: {revisions_path}"
     )
     return script, all_revisions
-
 
 # =============================================================================
 # NARRATIVE VOICE & NARRATION WEAVE
@@ -23981,6 +25067,165 @@ def detect_narration_gaps(script: List[Dict]) -> List[int]:
     return sorted(set(gap_positions))
 
 
+def _generate_narration_splash_pages_batched(
+    gap_indices: List[int],
+    script: List[Dict],
+    story_idea,
+    story_idea_str: str,
+    characters: List,
+    emotional_arc: Dict,
+    narrative_voice: str,
+    get_llm_response,
+    parse_json,
+    llm_model: str = None,
+    use_grok: bool = False,
+) -> Tuple[List[Tuple[int, Dict]], set]:
+    """Try to resolve MULTIPLE narration-splash gaps in a single LLM call.
+
+    Returns (results, resolved_indices) where `results` is the same
+    (script_idx, page_spec) shape the caller builds per-item, and
+    `resolved_indices` is the subset of `gap_indices` this call actually
+    produced a usable spec for — the caller falls back to the existing
+    per-item generation for anything not in that set, so a batch failure (bad
+    JSON, a truncated response, one weak entry) never loses a page, it only
+    loses the API-call savings for that run.
+
+    Capped at a handful of gaps per call — cramming many independent, already
+    long creative asks (each wants a distinct image description AND an
+    80-200 word narration passage) into one response risks diluted or
+    truncated output, which would be a worse trade than just making more
+    calls. Below that cap, one call covering several gaps is a clean win:
+    each ask is short and structurally identical, so nothing is lost by
+    answering them together.
+    """
+    if len(gap_indices) < 2:
+        return [], set()
+
+    _MAX_BATCH = 4
+    batch = gap_indices[:_MAX_BATCH]
+
+    voice_excerpt = (narrative_voice or _DEFAULT_NARRATIVE_VOICE)[:500]
+    char_block = '\n'.join(
+        f"  {c.name}: {(getattr(c, 'backstory', '') or '')[:60]}"
+        for c in (characters or [])[:5]
+    )
+
+    gap_blocks = []
+    for gi, script_idx in enumerate(batch):
+        surrounding = []
+        for offset in range(-2, 3):
+            ctx_idx = script_idx + offset
+            if 0 <= ctx_idx < len(script):
+                ctx_page = script[ctx_idx]
+                if not ctx_page.get('_act_break') and not ctx_page.get('_prologue'):
+                    surrounding.append(
+                        f"    p{ctx_page.get('page','?')} (act {ctx_page.get('act','?')}): "
+                        f"{str(ctx_page.get('beat',''))[:140]}"
+                    )
+        anchor_page = script[script_idx] if script_idx < len(script) else {}
+        gap_blocks.append(
+            f"GAP {gi} (script index {script_idx}):\n"
+            f"  Anchor beat: {str(anchor_page.get('beat',''))[:160]}\n"
+            f"  Anchor setting: {str(anchor_page.get('setting',''))[:100]}\n"
+            f"  Anchor act: {str(anchor_page.get('act','1'))}\n"
+            f"  Surrounding context:\n" + ("\n".join(surrounding) or "    (opening of story)")
+        )
+
+    prompt = (
+        f"{_SINGLE_IMAGE_RULE}\n\n"
+        "You are designing DEDICATED NARRATION PAGES for a graphic novel — "
+        f"{len(batch)} separate single full-page panels, each supporting an "
+        "extended narrator caption. Each does ONE of: BRIDGE (link two scenes "
+        "across time/space), ESTABLISH (place the reader in a new world/time/"
+        "register), DEEPEN (interiority images alone can't show), JUDGE "
+        "(the narrator weighs the moral cost), or FORESHADOW (plant a seed).\n\n"
+        f"NARRATIVE VOICE:\n{voice_excerpt}\n\n"
+        f"GENRE: {story_idea.genre}\nMOOD: {story_idea.mood}\n"
+        f"THEMES: {', '.join(story_idea.themes or [])}\n"
+        f"PREMISE: {story_idea.premise[:250]}\n\n"
+        f"CAST:\n{char_block}\n\n"
+        "Each gap below is INDEPENDENT — do not let one gap's content bleed "
+        "into another's; each earns its own distinct page.\n\n"
+        + "\n\n".join(gap_blocks) + "\n\n"
+        "Return a JSON array with EXACTLY one object per gap, IN THE SAME "
+        "ORDER, each shaped:\n"
+        "{\n"
+        '  "gap_index": <int, matching the GAP number above>,\n'
+        '  "job": "BRIDGE|ESTABLISH|DEEPEN|JUDGE|FORESHADOW",\n'
+        '  "image_description": "2-3 sentence visual description of the full-page panel image.",\n'
+        '  "narration_text": "Narrator caption in the established book voice. 80-200 words.",\n'
+        '  "setting": "Where/when this page is set",\n'
+        '  "emotional_tone": "The mood this page creates",\n'
+        '  "purpose": "One sentence: what does this page do for the reader?",\n'
+        '  "visual_keywords": ["keyword1", "keyword2", "keyword3"]\n'
+        "}\n"
+        "JSON array only, no other text."
+    )
+
+    try:
+        kwargs = {"temperature": 0.80, "max_completion_tokens": 900 * len(batch)}
+        if llm_model:
+            kwargs["openai_model"] = llm_model
+        kwargs["use_grok"] = use_grok
+        raw = get_llm_response(prompt, **kwargs)
+        parsed = parse_json(raw) or []
+        if not isinstance(parsed, list):
+            return [], set()
+
+        results: List[Tuple[int, Dict]] = []
+        resolved: set = set()
+        for entry in parsed:
+            if not isinstance(entry, dict) or not entry.get("narration_text"):
+                continue
+            try:
+                gi = int(entry.get("gap_index", -1))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= gi < len(batch)):
+                continue
+            script_idx = batch[gi]
+            anchor_page = script[script_idx] if script_idx < len(script) else {}
+            anchor_act = str(anchor_page.get('act', '1'))
+            page_spec = {
+                "page": anchor_page.get("page", 0),
+                "title": "",
+                "setting": entry.get("setting", str(anchor_page.get('setting', ''))),
+                "characters_present": [],
+                "beat": entry.get("purpose", "Narration page."),
+                "beat_id": f"narration_splash_{script_idx}",
+                "beat_type": "narration_splash",
+                "emotional_tone": entry.get("emotional_tone", story_idea.mood),
+                "visual_hook": entry.get("image_description", ""),
+                "cliffhanger": False,
+                "importance": "narration_splash",
+                "act": anchor_act,
+                "_narration_splash": True,
+                "_narration_job": entry.get("job", "BRIDGE"),
+                "_narration_purpose": entry.get("purpose", ""),
+                "panels": [{
+                    "panel_index": 1,
+                    "panel_type": "narration",
+                    "description": entry.get("image_description", ""),
+                    "characters_in_frame": [],
+                    "importance": "splash",
+                    "dialogue_density": "narration_heavy",
+                    "visual_keywords": entry.get("visual_keywords", []),
+                    "dialogue": [{
+                        "speaker": "NARRATOR",
+                        "text": entry.get("narration_text", ""),
+                        "bubble_type": "caption",
+                    }],
+                }],
+            }
+            results.append((script_idx, page_spec))
+            resolved.add(script_idx)
+
+        return results, resolved
+    except Exception as e:
+        logger.warning(f"  [NarrationSplash] Batched generation failed ({e}); falling back to per-item.")
+        return [], set()
+
+
 def generate_narration_splash_pages(
     gap_script_indices: List[int],
     script: List[Dict],
@@ -24003,6 +25248,11 @@ def generate_narration_splash_pages(
       - panels: one panel with a dramatic image description + extended narration
       - _narration_splash=True  → rendering pipeline uses generous caption layout
 
+    Tries a single batched LLM call first when there are 2+ gaps (see
+    _generate_narration_splash_pages_batched); any gap it doesn't resolve
+    falls through to the per-item generation below unchanged, so batching can
+    only save calls, never lose content.
+
     Returns a list of (script_index, page_spec) tuples in the same order as
     gap_script_indices.
     """
@@ -24010,9 +25260,25 @@ def generate_narration_splash_pages(
         return []
 
     result = []
+    remaining = list(gap_script_indices)
+
+    batch_results, resolved = _generate_narration_splash_pages_batched(
+        remaining, script, story_idea, story_idea_str, characters,
+        emotional_arc, narrative_voice, get_llm_response, parse_json,
+        llm_model, use_grok,
+    )
+    if resolved:
+        result.extend(batch_results)
+        remaining = [i for i in remaining if i not in resolved]
+        logger.info(
+            f"  [NarrationSplash] Batched {len(resolved)} of "
+            f"{len(gap_script_indices)} page(s) into a single call "
+            f"({len(remaining)} remaining via per-item generation)."
+        )
+
     story_pages = [p for p in script if not p.get('_act_break') and not p.get('_prologue')]
 
-    for script_idx in gap_script_indices:
+    for script_idx in remaining:
         # Gather context: the 2 pages before and after this gap
         surrounding = []
         for offset in range(-2, 3):
@@ -27350,6 +28616,7 @@ def regenerate_images_with_model(
     output_dir: str = None,
     image_model: str = "ZIMAGE",
     page_range: tuple = None,
+    page_ranges: list = None,
     panel_indices: list = None,
     pipe=None,
     # --- params accepted for forward-compatibility / caller convenience ---
@@ -27375,6 +28642,13 @@ def regenerate_images_with_model(
     Regenerate ONLY the images from prompts in panel_manifest.json.
     - Never modifies text or the manifest
     - Correctly saves files to working_dir/panels/ (no double nesting)
+
+    page_range:  single (start, end) inclusive page-number filter.
+    page_ranges: list of (start, end) inclusive page-number filters, for
+                 non-contiguous batches (e.g. [(58, 65), (73, 78), ...]).
+                 Merged with page_range if both are given. The whole batch
+                 is processed under ONE pipe load / unload, regardless of
+                 how many disjoint ranges are supplied.
     """
     import os
     import json
@@ -27384,7 +28658,12 @@ def regenerate_images_with_model(
     if image_model not in ('ZIMAGE', 'ERNIE', 'CHROMA', 'LENS', 'KLEIN2'):
         raise ValueError(f"Unsupported image_model: {image_model}")
 
-    _filter_range = (int(page_range[0]), int(page_range[1])) if page_range else None
+    _filter_ranges = []
+    if page_range:
+        _filter_ranges.append((int(page_range[0]), int(page_range[1])))
+    if page_ranges:
+        for _pr in page_ranges:
+            _filter_ranges.append((int(_pr[0]), int(_pr[1])))
     _filter_panels = set(panel_indices) if panel_indices else None
 
     logger.info(f"Regenerating images only → {working_dir}")
@@ -27407,7 +28686,7 @@ def regenerate_images_with_model(
                 pnum = int(key.split("_", 1)[1])
             except Exception:
                 continue
-        if _filter_range and not (_filter_range[0] <= pnum <= _filter_range[1]):
+        if _filter_ranges and not any(lo <= pnum <= hi for lo, hi in _filter_ranges):
             continue
         target_keys.append(key)
 
@@ -28938,6 +30217,70 @@ def _render_act_break_image(act_number: str, story_dna: Dict,
 
     return variant_records, prompt
 
+def _make_fallback_panel_image(width: int, height: int, label: str,
+                                story_dna: Optional[Dict] = None) -> Image.Image:
+    """Typeset placeholder image for a panel whose AI generation totally failed.
+
+    Used as the last-resort safety net in generate_panel_images(): if every
+    variant attempt for a panel raises (transient API error, OOM, malformed
+    prompt rejected by the model, etc.), the panel previously got NO manifest
+    entry at all — script.json still listed the page, but no image, no
+    file, nothing for compose_page to draw. For an ordinary story page the
+    validator catches and repairs that gap; for a special page (prologue,
+    narration-splash, act-interstitial, act-break) the validator explicitly
+    does NOT repair it (see comic_book_validator.detect_gaps) — so a special
+    page could ship in the final book with a blank/missing panel and no
+    warning anywhere the reader would see. This card guarantees SOME image
+    always exists, sized to the actual panel slot, in the book's own palette,
+    so a transient generation failure degrades gracefully instead of shipping
+    an empty hole in the page.
+
+    Not meant to be pretty — it is a visible "this needs a manual regenerate"
+    signal, not a substitute for real artwork.
+    """
+    dna = story_dna or {}
+    # Warm dark background tinted toward the book's own palette description
+    # rather than a jarring flat color, so it reads as "part of this book"
+    # even though it is a fallback.
+    bg = (24, 22, 28)
+    img = Image.new('RGB', (max(64, width), max(64, height)), bg)
+    draw = ImageDraw.Draw(img)
+    font_size = max(14, min(width, height) // 14)
+    font = get_narration_font(font_size)
+    text = (label or 'Image unavailable — needs regeneration').strip()
+    # Simple word-wrap to ~80% of the card width.
+    max_w = int(width * 0.8)
+    words, rows, cur = text.split(), [], ''
+    for w in words:
+        trial = (cur + ' ' + w).strip()
+        try:
+            tw = font.getbbox(trial)[2] - font.getbbox(trial)[0]
+        except Exception:
+            tw = len(trial) * (font_size // 2)
+        if tw <= max_w or not cur:
+            cur = trial
+        else:
+            rows.append(cur)
+            cur = w
+    if cur:
+        rows.append(cur)
+    line_h = int(font_size * 1.4)
+    total_h = line_h * len(rows)
+    y = max(0, (height - total_h) // 2)
+    for row in rows:
+        try:
+            tw = font.getbbox(row)[2] - font.getbbox(row)[0]
+        except Exception:
+            tw = len(row) * (font_size // 2)
+        x = max(0, (width - tw) // 2)
+        draw.text((x, y), row, font=font, fill=(220, 214, 200))
+        y += line_h
+    # Thin border so the placeholder is visually distinct from a real panel
+    # (and easy to spot when scanning proofs for pages that need a redo).
+    draw.rectangle([2, 2, width - 3, height - 3], outline=(120, 60, 60), width=3)
+    return img
+
+
 def _make_act_break_plain(act_number: str, story_dna: Dict,
                            arc_state: Dict) -> Image.Image:
     """Fallback: typeset act-break card with no AI image (used if pipe unavailable)."""
@@ -28951,6 +30294,366 @@ def _make_act_break_plain(act_number: str, story_dna: Dict,
         [{'text': label, 'size': 60, 'color': (235, 228, 210), 'gap_before': 0}],
         bg=bg, top_rule=True,
     )
+
+
+def audit_cliffhanger_parity(script: List[Dict]) -> List[int]:
+    """Find cliffhanger pages that land on the WRONG physical page for the
+    page-turn trick to work.
+
+    In a printed book, page 1 is always a right-hand (recto) page, so odd
+    page numbers are recto and even are verso — the same convention this
+    file's own margin logic already uses (_is_left = page_number % 2 == 0).
+    A cliffhanger only works as a "must turn the page to find out" moment
+    when it's the last thing on a RECTO (odd) page: finishing an odd page
+    forces a physical page turn before the reader can continue, whereas a
+    cliffhanger on an even page is immediately followed by the facing odd
+    page in the SAME spread — no turn required, so the suspense beat doesn't
+    get the beat of silence a real page-turn creates.
+
+    Returns the list of page numbers that are cliffhangers on the wrong
+    (even) parity. Pure/deterministic, no LLM, never raises.
+    """
+    if not script:
+        return []
+    try:
+        misaligned = []
+        for page in script:
+            if not isinstance(page, dict) or page.get('_act_break'):
+                continue
+            if not page.get('cliffhanger'):
+                continue
+            try:
+                pnum = int(page.get('page', 0))
+            except (TypeError, ValueError):
+                continue
+            if pnum > 0 and pnum % 2 == 0:   # even = verso = wrong side
+                misaligned.append(pnum)
+        if misaligned:
+            logger.info(
+                f"  [PageTurn] {len(misaligned)} cliffhanger page(s) land on "
+                f"the wrong (left-hand) side for a page-turn reveal: {misaligned}"
+            )
+        return misaligned
+    except Exception as e:
+        logger.warning(f"  [PageTurn] Parity audit failed ({e}); skipping.")
+        return []
+
+
+def align_cliffhanger_parity(script: List[Dict]) -> List[Dict]:
+    """Nudge misaligned cliffhangers (see audit_cliffhanger_parity) onto the
+    correct (odd/recto) page by inserting a single minimal transition page
+    directly before each one — shifting it, and everything after it, by +1.
+
+    The inserted page is deliberately content-light (a single quiet
+    transition beat, no dialogue) rather than LLM-authored: the fix is
+    purely about WHERE the page-turn lands, not about adding new story
+    content, and a silent transition beat is a natural, low-risk page to
+    spend on a parity nudge (it also renders through the normal panel
+    pipeline afterward, so it still gets real art, just no extra LLM call to
+    create it up front).
+
+    Processes misalignments in DESCENDING page order so each insertion's
+    renumbering can't invalidate a not-yet-processed target's page number,
+    and re-checks parity after each insertion (a fix can, in rare cases,
+    shift a later cliffhanger's own parity by the same +1, which this
+    correctly leaves alone if it happens to land right).
+
+    Opt-in only (see synthesize_comic_book(align_cliffhangers=...)) since it
+    changes the book's page count and numbering — never runs unless the
+    caller explicitly asks for it.
+    """
+    if not script:
+        return script
+    misaligned = audit_cliffhanger_parity(script)
+    if not misaligned:
+        return script
+
+    for pnum in sorted(misaligned, reverse=True):
+        # Re-derive: an earlier (higher-numbered) fix in this loop may have
+        # already shifted this page's number or resolved its parity.
+        target = next(
+            (p for p in script if isinstance(p, dict)
+             and int(p.get('page', -1)) == pnum and p.get('cliffhanger')),
+            None,
+        )
+        if not target or int(target.get('page', 0)) % 2 != 0:
+            continue   # already fixed or no longer present
+
+        insert_before = int(target['page'])
+        for pg in script:
+            if isinstance(pg, dict):
+                pn = int(pg.get('page', 0))
+                if pn >= insert_before:
+                    pg['page'] = pn + 1
+
+        transition_pg: Dict = {
+            'page': insert_before,
+            'title': '',
+            'setting': target.get('setting', ''),
+            'characters_present': [],
+            'beat': 'A quiet breath before the turn.',
+            'beat_id': '',
+            'emotional_tone': target.get('emotional_tone', ''),
+            'visual_hook': 'A brief transitional visual beat.',
+            'cliffhanger': False,
+            'importance': 'standard',
+            'act': target.get('act', '1'),
+            '_transition_page': True,
+            'panels': [{
+                'panel_index': 1,
+                'description': (
+                    f"A quiet transitional moment continuing the scene at "
+                    f"{target.get('setting', 'the same location')} — no new "
+                    f"action, a breath before what comes next."
+                ),
+                'composition': 'wide_shot',
+                'camera_angle': 'eye_level',
+                'mood': target.get('emotional_tone', ''),
+                'characters_in_frame': [],
+                'sensory_anchor': '',
+                'importance': 'standard',
+                'dialogue': [],
+                'sfx': [],
+            }],
+        }
+        script.insert(
+            next((i for i, p in enumerate(script)
+                  if isinstance(p, dict) and int(p.get('page', 0)) >= insert_before), len(script)),
+            transition_pg,
+        )
+        logger.info(
+            f"  [PageTurn] Inserted a transition page before p{insert_before} "
+            f"so the cliffhanger now lands on the correct (right-hand) page."
+        )
+
+    script.sort(key=lambda p: int(p.get('page', 0)) if isinstance(p, dict) else 0)
+    return script
+
+
+def insert_act_break_placeholders(
+        script: List[Dict],
+        emotional_arc: Optional[Dict] = None,
+) -> List[Dict]:
+    """Insert EMPTY (imageless) act-break page slots at every act transition.
+
+    This is the structural half of what insert_act_breaks() used to do in a
+    single step. It runs BEFORE plan_page_layouts / the pre-image checkpoint /
+    any image generation — so the book's page COUNT and NUMBERING are 100%
+    final before a single pixel is generated. plan_page_layouts() then builds
+    every page's layout FROM SCRATCH afterward (it already special-cases
+    _act_break for the single full-bleed panel treatment), so this function
+    only needs to touch `script` — there is no separate layouts list to keep
+    in sync at this point in the pipeline. generate_panel_images() then
+    renders the act-break artwork through the exact same multi-variant /
+    scored / fallback-protected pipeline as every other panel (it recognises
+    a page via its `_act_break` flag — see the `_is_act_break_panel` branch
+    there), rather than a separate bespoke single-shot path.
+
+    This replaces the old design where insert_act_breaks() ran AFTER cover +
+    panel image generation and relied on _compute_final_page_numbers() to
+    PREDICT where breaks would land so files could be pre-named correctly.
+    That prediction trick worked, but it meant image generation started
+    before the page count was actually settled — exactly the ordering the
+    pipeline is now expected not to have. With breaks inserted here first,
+    _compute_final_page_numbers() has nothing left to predict (see the guard
+    at the top of that function) and simply returns the identity mapping.
+
+    Mirrors insert_act_breaks()'s transition-detection and threshold logic
+    exactly (same >20-page threshold, same forward-only transition detection,
+    same Act-One-after-prologue placement) so behaviour is unchanged — only
+    the WHEN and the "does it also render pixels" differ.
+
+    Returns `script` with every page already at its FINAL number.
+    """
+    emotional_arc = emotional_arc if emotional_arc is not None else {}
+
+    # Idempotency guard: a script that already has act-break pages was
+    # already processed (e.g. this function was called twice, or the working
+    # directory is being resumed after a prior run already inserted breaks).
+    # Running the transition-detection again on top of existing break pages
+    # would insert a second, duplicate set — so bail out instead.
+    if any(p.get('_act_break') for p in script):
+        logger.info(
+            "  [ActBreaks] Script already contains act-break page(s); "
+            "skipping placeholder insertion."
+        )
+        return script
+
+    story_pages = [p for p in script if not p.get('_act_break')]
+    n_story = len(story_pages)
+
+    if n_story <= 20:
+        logger.info(
+            f"  Skipping act breaks: {n_story}-page book reads as a single "
+            f"continuous piece (threshold: >20 pages)."
+        )
+        return script
+
+    _fwd = _forward_act_transitions(story_pages)
+    _act_at_page = {int(p.get('page', 0)): str(p.get('act', '1')) for p in story_pages}
+    transitions: List[Tuple[int, str]] = [
+        (pg, _act_at_page.get(pg, '1')) for pg in _fwd
+    ]
+
+    has_multiple_acts = len(set(str(p.get('act', '1')) for p in story_pages)) > 1
+    _real_story = [p for p in story_pages
+                   if not p.get('_prologue')
+                   and p.get('importance') != 'prologue']
+    first_page_num = min((int(p.get('page', 1)) for p in _real_story),
+                          default=min((int(p.get('page', 1)) for p in story_pages), default=1))
+    if has_multiple_acts:
+        transitions = [(first_page_num, '1')] + list(transitions)
+
+    if not transitions:
+        logger.info("  No act transitions detected; no act breaks inserted.")
+        return script
+
+    logger.info(
+        f"  Inserting {len(transitions)} act-break page slot(s) "
+        f"(structure only — art renders in the normal panel pass): "
+        f"{[f'Act {a}' for _, a in transitions]}"
+    )
+
+    act_labels = {'1': 'One', '2': 'Two', '3': 'Three', '4': 'Four', '5': 'Five'}
+
+    # Insert in reverse page order so offsets don't cascade — identical to
+    # insert_act_breaks()'s own ordering.
+    for insert_before, act_number in reversed(transitions):
+        arc_state = emotional_arc.get(insert_before, {})
+
+        for pg in script:
+            pnum = int(pg.get('page', 0))
+            if pnum >= insert_before:
+                pg['page'] = pnum + 1
+        if emotional_arc:
+            new_arc: Dict = {}
+            for pnum, state in emotional_arc.items():
+                new_key = pnum + 1 if pnum >= insert_before else pnum
+                new_arc[new_key] = state
+            emotional_arc.clear()
+            emotional_arc.update(new_arc)
+
+        act_word = act_labels.get(str(act_number), str(act_number))
+        break_pg: Dict = {
+            'page':               insert_before,
+            'title':              f'Act {act_word}',
+            'setting':            '',
+            'characters_present': [],
+            'beat':               f'Act {act_word} begins.',
+            'beat_id':            '',
+            'emotional_tone':     arc_state.get('key_emotion', ''),
+            'visual_hook':        f'Act {act_word} title card',
+            'cliffhanger':        False,
+            'importance':         'splash',
+            'act':                act_number,
+            '_act_break':         True,
+            'panels': [{
+                'panel_index':         1,
+                'description':         f'Full-bleed illustrated Act {act_word} title card.',
+                'composition':         'splash',
+                'camera_angle':        'eye_level',
+                'mood':                arc_state.get('key_emotion', ''),
+                'characters_in_frame': [],
+                'sensory_anchor':      '',
+                'importance':          'splash',
+                'dialogue':            [],
+                'sfx':                 [],
+            }],
+        }
+
+        script.insert(
+            next((i for i, p in enumerate(script)
+                  if int(p.get('page', 0)) >= insert_before), len(script)),
+            break_pg,
+        )
+
+    script.sort(key=lambda p: int(p.get('page', 0)))
+    logger.info(f"  Act-break page slots inserted. Total pages now: {len(script)}")
+    return script
+
+
+def _build_act_break_prompt(page_script: Dict, story_dna: Dict,
+                             story_idea: 'StoryIdea', arc_state: Dict,
+                             act_pages: List[Dict]) -> str:
+    """Build the act-break title-card image prompt (text only — no pixels).
+
+    Extracted from the former all-in-one _render_act_break_image() so
+    generate_panel_images() can render act-break art through the standard
+    multi-variant / scored / fallback-protected panel pipeline instead of a
+    separate bespoke image loop. Same LLM-written-description-with-
+    deterministic-fallback approach as before; only the "who calls
+    _safe_gen_image" responsibility has moved.
+    """
+    act_number = str(page_script.get('act', '1'))
+    act_labels = {'1': 'One', '2': 'Two', '3': 'Three', '4': 'Four', '5': 'Five'}
+    act_word  = act_labels.get(act_number, act_number)
+    act_roman = {'1': 'I', '2': 'II', '3': 'III', '4': 'IV', '5': 'V'}.get(act_number, act_number)
+
+    art_style = _strip_comic_terms_from_image_prompt(
+        _strip_photoreal_terms(
+            story_dna.get('art_style', 'inked graphic novel illustration with airbrush gradients of light and color')))
+    palette  = arc_state.get('palette_state', story_dna.get('color_palette', ''))
+    lighting = arc_state.get('lighting_state', story_dna.get('lighting_signature', ''))
+    emotion  = arc_state.get('key_emotion',
+                              getattr(story_idea, 'mood', '') if story_idea else '')
+    genre    = getattr(story_idea, 'genre', '') if story_idea else ''
+    themes   = (', '.join((story_idea.themes or [])[:3])
+                if story_idea and hasattr(story_idea, 'themes') else '')
+
+    act_pages = [p for p in (act_pages or []) if not _is_matter_page(p)]
+    beat_details: List[str] = []
+    for pg in act_pages[:3]:
+        setting = (pg.get('setting') or '').strip()
+        beat    = (pg.get('beat') or pg.get('title') or '').strip()
+        hook    = (pg.get('visual_hook') or '').strip()
+        chars   = pg.get('characters_present') or []
+        if setting and setting not in beat_details:
+            beat_details.append(setting)
+        if hook and hook not in beat_details:
+            beat_details.append(hook)
+        if beat and len(beat) < 120 and beat not in beat_details:
+            beat_details.append(beat)
+        if chars:
+            beat_details.append(', '.join(str(c) for c in chars[:3]))
+
+    image_description = _llm_write_act_break_image_description(
+        act_word=act_word, act_roman=act_roman, beat_details=beat_details,
+        art_style=art_style, palette=palette, lighting=lighting,
+        emotion=emotion, themes=themes, genre=genre,
+    )
+    if not image_description:
+        if beat_details:
+            scene_desc = '; '.join(beat_details)
+            image_description = (
+                f"{art_style} full-page illustrated scene: "
+                f"{scene_desc}. "
+                f"Mood: {emotion}. "
+                f"Colour palette: {palette}. "
+                f"{('Lighting: ' + lighting + '.') if lighting else ''} "
+                f"Themes: {themes}. "
+                f"Full-bleed, no panel borders, single dramatic unified composition"
+            )
+        else:
+            image_description = (
+                f"{art_style} full-page illustrated scene, "
+                f"Act {act_word} — {emotion} atmosphere, "
+                f"palette: {palette}, themes: {themes}, "
+                f"full-bleed dramatic composition, no panel borders"
+            )
+    image_description = _strip_comic_terms_from_image_prompt(
+        _strip_photoreal_terms(image_description)
+    )
+
+    # Dedicated Art Style prefix — same reasoning as compose_panel_prompt /
+    # compose_narration_background_prompt: the strongest, first-read anchor.
+    prompt = (
+        f"Art Style: {art_style}.\n"
+        f"{image_description}. "
+        f"The ONLY text in the image is 'ACT {act_roman}' displayed in large "
+        f"bold hand-lettered comic typography, centered prominently on the image.\n"
+        + ANTI_PHOTOREALISM_CLAUSE
+    )
+    return prompt
 
 
 def insert_act_breaks(script: List[Dict],
@@ -28978,6 +30681,21 @@ def insert_act_breaks(script: List[Dict],
     Returns updated (script, layouts, manifest).
     """
     emotional_arc = emotional_arc or {}
+
+    # Idempotency guard — as of the pipeline reorder, act-break pages are
+    # normally inserted MUCH earlier by insert_act_break_placeholders(),
+    # before any image generation. This function is kept for backward
+    # compatibility (rebuilding an older working directory saved before that
+    # change) but must never run twice on the same script — a second pass
+    # would detect the same transitions again and insert a duplicate set of
+    # break pages.
+    if any(p.get('_act_break') for p in script):
+        logger.info(
+            "  [ActBreaks] Script already contains act-break page(s); "
+            "insert_act_breaks() is a no-op (breaks were already inserted "
+            "earlier in the pipeline by insert_act_break_placeholders)."
+        )
+        return script, layouts, manifest
 
     # Count story pages (exclude any existing act-break pages)
     story_pages = [p for p in script if not p.get('_act_break')]
@@ -29632,6 +31350,209 @@ def enhance_existing_comic(working_dir: str, output_dir: str,
 
 
 # =============================================================================
+# COLD-READ QA PASS — reads the finished book as a first-time reader
+# =============================================================================
+# Every other review pass in this pipeline (critique_and_amplify_beats,
+# reinforce_arc_from_beat_critic, polish_book_dialogue) evaluates the WRITING
+# against craft rules, voice consistency, or the story bible. None of them
+# ask the one question a reader actually experiences: reading this cold, does
+# it make sense, and does anyone feel anything? This pass does that
+# specifically, separately, and reports findings distinct from craft notes.
+# =============================================================================
+
+def cold_read_qa_pass(
+    script: List[Dict],
+    story_idea: 'StoryIdea',
+    characters: List,
+) -> Dict[int, List[Dict[str, str]]]:
+    """Read the finished script cold, act by act, and flag reader-experience
+    problems: confusion (stakes/context unclear to someone with no author
+    knowledge) and flatness (a beat that should land emotionally but reads
+    inert). ONE call per act (batched across every page of that act, not one
+    call per page) — this is naturally the right chunk size: an act is long
+    enough that findings need real context, short enough to stay well inside
+    a token budget.
+
+    Returns {page_number: [{'issue': 'confusing'|'flat', 'note': str}, ...]}.
+    Empty dict on total failure or an empty script — never raises.
+    """
+    if not script:
+        return {}
+
+    acts: Dict[str, List[Dict]] = {}
+    for page in script:
+        if not isinstance(page, dict) or page.get('_act_break'):
+            continue
+        acts.setdefault(str(page.get('act', '1')), []).append(page)
+
+    char_names = ', '.join(getattr(c, 'name', '') for c in (characters or [])[:10] if getattr(c, 'name', ''))
+    findings: Dict[int, List[Dict[str, str]]] = {}
+
+    for act_num, pages in sorted(acts.items(), key=lambda kv: _parse_act_number(kv[0])):
+        pages_sorted = sorted(pages, key=lambda p: int(p.get('page', 0)))
+        digest_lines = []
+        for pg in pages_sorted:
+            dlg = ' / '.join(
+                str(d.get('text', ''))[:80] for panel in (pg.get('panels') or [])
+                for d in (panel.get('dialogue') or []) if isinstance(d, dict)
+            )[:220]
+            digest_lines.append(
+                f"  p{pg.get('page','?')}: {str(pg.get('beat',''))[:140]}"
+                + (f" | Dialogue: {dlg}" if dlg else "")
+            )
+        digest = "\n".join(digest_lines)
+        if _tb is not None:
+            digest = _tb.clamp_text(digest, 6000, where="cold_read.act_digest")
+
+        prompt = (
+            "You are a FIRST-TIME READER of this graphic novel — not an "
+            "editor grading craft, a reader experiencing the story cold, "
+            "page by page, with no author knowledge beyond what's actually "
+            "on the page.\n\n"
+            f"CAST: {char_names}\n"
+            f"GENRE: {story_idea.genre}  MOOD: {story_idea.mood}\n\n"
+            f"ACT {act_num} — page-by-page digest (beat + any dialogue):\n{digest}\n\n"
+            "Flag ONLY real problems, as a reader would actually notice them:\n"
+            "  CONFUSING — a page where the stakes, who's who, or why this "
+            "matters would genuinely be unclear to a first-time reader (not "
+            "'could be more detailed' — actually confusing)\n"
+            "  FLAT — a beat clearly meant to land emotionally (a loss, a "
+            "reveal, a turn) that reads inert or mechanical on the page as "
+            "written\n\n"
+            "Be sparing — most pages are fine and should get NO entry. Only "
+            "flag genuine problems a reader would actually stumble on.\n\n"
+            "Return JSON only:\n"
+            '{"flags": [{"page": <int>, "issue": "confusing|flat", '
+            '"note": "one sentence, specific to this page"}]}\n'
+            "JSON only. Empty flags array if the act reads cleanly."
+        )
+
+        try:
+            raw = get_openai_prompt_response(
+                prompt, temperature=0.4, max_completion_tokens=1500,
+                openai_model=openai_model_large, use_grok=USE_GROK,
+            )
+            parsed = parse_json_response(raw) or {}
+            flags = parsed.get("flags") or []
+            if not isinstance(flags, list):
+                continue
+            for f in flags:
+                if not isinstance(f, dict):
+                    continue
+                try:
+                    pnum = int(f.get("page", -1))
+                except (TypeError, ValueError):
+                    continue
+                issue = str(f.get("issue", "")).strip().lower()
+                note = str(f.get("note", "")).strip()
+                if pnum > 0 and issue in ("confusing", "flat") and note:
+                    findings.setdefault(pnum, []).append({"issue": issue, "note": note})
+        except Exception as e:
+            logger.warning(f"  [ColdRead] Act {act_num} QA call failed ({e}); skipping.")
+
+    if findings:
+        logger.info(
+            f"  [ColdRead] Flagged {sum(len(v) for v in findings.values())} "
+            f"issue(s) across {len(findings)} page(s): "
+            + ", ".join(f"p{k}({','.join(x['issue'] for x in v)})" for k, v in sorted(findings.items())[:15])
+        )
+    else:
+        logger.info("  [ColdRead] No reader-experience issues flagged.")
+    return findings
+
+
+def apply_cold_read_punchup(
+    script: List[Dict],
+    findings: Dict[int, List[Dict[str, str]]],
+    story_idea: 'StoryIdea',
+    max_pages: int = 12,
+) -> int:
+    """Targeted rewrite of pages the cold-read pass flagged. Capped at
+    `max_pages` (highest-severity first — 'confusing' before 'flat', since an
+    unclear page costs the reader more than a flat one) to bound cost; the
+    rest stay flagged in the manifest/logs for a human pass rather than
+    burning API calls on diminishing-return fixes.
+
+    Rewrites dialogue/caption TEXT only (never descriptions or structure) —
+    the same scope discipline review_and_enhance_dialog already uses, so this
+    pass can't accidentally invalidate continuity, layout, or image prompts
+    that were built from the page's other fields.
+
+    Returns the number of pages actually revised.
+    """
+    if not script or not findings:
+        return 0
+
+    ranked = sorted(
+        findings.items(),
+        key=lambda kv: (0 if any(f['issue'] == 'confusing' for f in kv[1]) else 1, kv[0]),
+    )[:max_pages]
+
+    by_page = {int(p.get('page', 0)): p for p in script if isinstance(p, dict)}
+    revised = 0
+
+    for pnum, issues in ranked:
+        page = by_page.get(pnum)
+        if not page:
+            continue
+        panels = page.get('panels') or []
+        dialogue_block = []
+        for pi, panel in enumerate(panels):
+            for di, d in enumerate(panel.get('dialogue') or []):
+                if isinstance(d, dict) and str(d.get('text', '')).strip():
+                    dialogue_block.append(
+                        f"  [{pi}.{di}] {d.get('speaker','?')}: {d.get('text','')}"
+                    )
+        if not dialogue_block:
+            continue
+
+        notes = "; ".join(f"{f['issue'].upper()}: {f['note']}" for f in issues)
+        prompt = (
+            "A first-time reader flagged this graphic-novel page with a "
+            "specific problem. Rewrite ONLY the dialogue/caption lines below "
+            "to fix it — do not change who says what or add new lines, just "
+            "sharpen the existing ones so the problem is addressed.\n\n"
+            f"PAGE BEAT: {page.get('beat','')}\n"
+            f"READER'S NOTE: {notes}\n\n"
+            "CURRENT LINES (format [panel.line] SPEAKER: text):\n"
+            + "\n".join(dialogue_block) + "\n\n"
+            "Return JSON only: {\"lines\": [{\"ref\": \"[panel.line]\", "
+            "\"text\": \"revised text\"}]}. Only include lines you actually "
+            "changed. JSON only."
+        )
+        try:
+            raw = get_openai_prompt_response(
+                prompt, temperature=0.6, max_completion_tokens=900,
+                openai_model=openai_model_large, use_grok=USE_GROK,
+            )
+            parsed = parse_json_response(raw) or {}
+            lines = parsed.get("lines") or []
+            changed = False
+            for ln in lines:
+                if not isinstance(ln, dict):
+                    continue
+                ref = str(ln.get("ref", ""))
+                new_text = str(ln.get("text", "")).strip()
+                m = re.match(r'\[?(\d+)\.(\d+)\]?', ref)
+                if not m or not new_text:
+                    continue
+                pi, di = int(m.group(1)), int(m.group(2))
+                if 0 <= pi < len(panels):
+                    dlg = panels[pi].get('dialogue') or []
+                    if 0 <= di < len(dlg) and isinstance(dlg[di], dict):
+                        dlg[di]['text'] = sanitize_text_for_prompt(new_text)
+                        changed = True
+            if changed:
+                revised += 1
+        except Exception as e:
+            logger.warning(f"  [ColdRead] Punch-up failed for page {pnum} ({e}).")
+
+    if revised:
+        logger.info(f"  [ColdRead] Punched up {revised} of {len(ranked)} flagged page(s).")
+    return revised
+
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -29650,6 +31571,7 @@ def synthesize_comic_book(
     use_grok: bool = None,
     image_model: str = None,
     scene_diversity = 'auto',
+    align_cliffhangers: bool = False,
 ) -> Dict[str, str]:
     """End-to-end comic book synthesis.
     
@@ -29689,6 +31611,13 @@ def synthesize_comic_book(
                              A dict fine-tunes: {'max_share', 'min_breathing_frac',
                              'vary_manifestation', 'strategy'} where strategy is
                              'vary' (default) | 'thin' | a float share.
+        align_cliffhangers:  When True, cliffhanger pages that land on the
+                             wrong (left-hand/verso) physical page for a
+                             page-turn reveal are nudged onto the correct
+                             side by inserting a minimal transition page
+                             before them. Off by default because it changes
+                             the book's page count; detection always runs
+                             and is logged either way.
     
     Returns:
         dict with paths: {docx, pdf, cbz, working_dir, manifest}
@@ -30087,6 +32016,24 @@ def synthesize_comic_book(
             logger.warning(f"  Emotional arc authoring failed ({e}); will fall back at render time.")
             project.story_dna['_emotional_arc'] = {}
 
+        # === Want vs. Need: the internal-truth arc ===
+        # The plot's setup/payoff ledger already exists; this is the same
+        # idea applied to each lead's INTERNAL arc (what they think they need
+        # vs. what they actually need) — usually the actual engine of reader
+        # empathy, and previously nothing in the pipeline tracked it at all.
+        logger.info("Extracting want/need (internal truth) arcs for lead characters...")
+        try:
+            _truth_arc = build_character_truth_arc(
+                story_idea, characters, required_beats,
+                story_idea_str=story_idea_str, target_pages=target_pages,
+            )
+            project.story_dna['_truth_arc'] = _truth_arc
+            if _truth_arc:
+                tag_want_need_beats(script_raw, _truth_arc)
+        except Exception as e:
+            logger.warning(f"  [TruthArc] Pass skipped ({e}).")
+            project.story_dna['_truth_arc'] = {}
+
         # Bridge the beat critic → the panel emotion layer: pages covered by
         # emotionally powerful (or critic-amplified) beats get their arc
         # intensity lifted, so amplify_panel_expressions pushes passion/drama
@@ -30161,9 +32108,14 @@ def synthesize_comic_book(
         # snapping. Runs AFTER the per-character arcs set the emotion facet and
         # BEFORE amplification, so the transition note is amplified too.
         try:
+            _focus_weights = compute_character_focus_weights(script_raw, characters)
+            if _focus_weights:
+                project.story_dna['_focus_weights'] = _focus_weights
+                logger.info(f"  [Focus] Character focus weights: {_focus_weights}")
             track_emotional_continuity(
                 script_raw,
                 emotional_arc=project.story_dna.get('_emotional_arc', {}),
+                focus_weights=_focus_weights,
             )
         except Exception as _e:
             logger.warning(f"  [EmotionContinuity] Skipped ({_e}).")
@@ -30207,6 +32159,7 @@ def synthesize_comic_book(
             script_raw = amplify_panel_expressions(
                 script_raw, story_idea,
                 emotional_arc=project.story_dna.get('_emotional_arc', {}),
+                focus_weights=project.story_dna.get('_focus_weights', {}),
             )
         except Exception as _e:
             logger.warning(f"  Expression amplification skipped ({_e}).")
@@ -30496,6 +32449,72 @@ def synthesize_comic_book(
             logger.warning(f"  [ActInterstitial] Pass skipped ({_ie}).")
             logger.warning(f"  [ActInterstitial] Traceback: {_tb.format_exc()}")
 
+        # === Act breaks: reserve page slots BEFORE any image is generated ===
+        # This is the LAST page-count-changing pass in the pipeline — it must
+        # run after every other pass that can add pages (prologue, character-
+        # intro, backstory, showcase, worldbuilding, chapter-title, narration-
+        # splash, act-interstitial all run above) so it sees the true, final
+        # page count and inserts breaks at the right seams. No pixels are
+        # generated here (see insert_act_break_placeholders' docstring) — the
+        # actual artwork renders later, inside generate_panel_images(), via
+        # the same multi-variant/scored/fallback-protected path as every
+        # other panel. This guarantees the page count reported by this run,
+        # and the numbering every filename is based on, cannot change again
+        # after this point — image generation has not started yet.
+        try:
+            script_raw = insert_act_break_placeholders(
+                script_raw, emotional_arc=project.story_dna.get('_emotional_arc', {}),
+            )
+        except Exception as _ab_e:
+            logger.warning(f"  [ActBreaks] Placeholder insertion skipped ({_ab_e}).")
+
+        # === Cliffhanger / page-turn print-parity ===
+        # Detection always runs (cheap, just logged); the fix itself changes
+        # page count so it only applies when explicitly requested. Runs here
+        # — after act breaks (which also shift numbering) and before layout
+        # planning — so it sees final page numbers and, if it inserts a
+        # transition page, that insertion is itself finished before any
+        # image is generated, same as every other page-count-changing pass.
+        try:
+            if align_cliffhangers:
+                script_raw = align_cliffhanger_parity(script_raw)
+            else:
+                audit_cliffhanger_parity(script_raw)
+        except Exception as _cp_e:
+            logger.warning(f"  [PageTurn] Parity check skipped ({_cp_e}).")
+
+        # Re-lock style continuity AFTER all page-adding passes ────────────
+        # track_style_continuity() was first run right after build_story_dna
+        # (see above), before apply_all_improvements / splash promotion /
+        # dialogue split / narration-splash / act-interstitial had added a
+        # single page. Every page injected by those passes — prologue,
+        # character-intro, backstory, showcase, worldbuilding, chapter-title,
+        # narration-splash, act-interstitial — was therefore never annotated
+        # with a _style_lock, which is the SAME class of bug the act-number
+        # re-propagation right above this comment exists to fix, just for
+        # style instead of act numbers. An unlocked panel gets no positive
+        # style anchor and no negative-prompt exclusion terms, so it is the
+        # most likely panel in the book to drift toward photorealism. Re-
+        # running here (idempotent, pure pattern-matching, no LLM calls) picks
+        # up every page that now exists, right before layout planning locks
+        # in the page set that image generation will actually render.
+        try:
+            track_style_continuity(
+                script_raw, story_idea=story_idea, story_dna=project.story_dna
+            )
+        except Exception as _sc_e:
+            logger.warning(f"  [StyleContinuity] Re-lock after page-adding passes skipped ({_sc_e}).")
+
+        # Re-tag want/need beats + check climax delivery, now that the page
+        # set (and therefore _designate_climax_page's answer) is settled.
+        try:
+            _truth_arc = project.story_dna.get('_truth_arc') or {}
+            if _truth_arc:
+                tag_want_need_beats(script_raw, _truth_arc)
+                verify_climax_delivers_truth(script_raw, _truth_arc)
+        except Exception as _ta_e:
+            logger.warning(f"  [TruthArc] Re-tag / climax check skipped ({_ta_e}).")
+
         # Layouts — dramaturgical, driven by the emotional arc
         layouts = plan_page_layouts(
             script_raw, project.story_dna.get('_emotional_arc', {})
@@ -30649,10 +32668,18 @@ def synthesize_comic_book(
             project.story_dna.get('_cover_style_count', '?') if isinstance(project.story_dna, dict) else '?',
         )
 
-        # === Act-break pages: insert illustrated act-title cards ===
-        # Done AFTER panel generation (pipe is warm, no extra load) and BEFORE
-        # page composition so the breaks render cleanly into the final layout.
-        logger.info("Inserting act-break pages...")
+        # === Act-break pages: backward-compatible fallback only ===
+        # Act-break page SLOTS are now reserved much earlier — by
+        # insert_act_break_placeholders(), before layout planning / the
+        # pre-image checkpoint / any image generation — specifically so the
+        # page count is final before a single pixel is produced, and their
+        # artwork is rendered inside generate_panel_images() above through
+        # the standard per-panel path. insert_act_breaks() therefore no-ops
+        # here in the normal run (its own idempotency guard detects the
+        # break pages already exist and returns immediately). It is kept as
+        # a safety net purely for the case where the earlier pass raised and
+        # was swallowed by its try/except — so a run can never silently end
+        # up with zero act breaks just because that one pass failed.
         panels_dir = os.path.join(project.working_dir, "panels")
         create_directory_if_not_exists(panels_dir)
         script, layouts, manifest = insert_act_breaks(
@@ -30798,6 +32825,32 @@ def synthesize_comic_book(
         script, _ed = polish_book_dialogue(script, project)
     except Exception as _e:
         logger.warning(f"  [Director] book-level re-polish skipped ({_e}).")
+
+    # === Phase 6.95: Cold-read QA (reads the book as a first-time reader) ===
+    # Distinct from every pass above: those all evaluate against craft rules,
+    # voice consistency, or the story bible. This asks whether the finished
+    # book actually reads clearly and lands emotionally for someone with no
+    # author knowledge — a different failure mode none of the other passes
+    # can catch by construction. Runs after the book-level polish (so it's
+    # reading the near-final text) and before the density fit (so any
+    # punch-up rewrite is included in the word-budget guard).
+    try:
+        _cold_read_findings = cold_read_qa_pass(script, project.story_idea, project.characters)
+        if _cold_read_findings:
+            apply_cold_read_punchup(script, _cold_read_findings, project.story_idea)
+            project.story_dna['_cold_read_findings'] = _cold_read_findings
+    except Exception as _cr_e:
+        logger.warning(f"  [ColdRead] Pass skipped ({_cr_e}).")
+
+    # === Phase 6.96: Proactive silence (the wordless beat) ===
+    # Runs on the near-final dialogue (after review, narration weave,
+    # callbacks, the book-level director polish, and cold-read punch-up) so
+    # it's judging what will actually ship, and before the density fit so a
+    # newly-silenced panel is correctly excluded from that budget pass.
+    try:
+        enforce_emotional_silence(script, project.story_dna.get('_emotional_arc', {}))
+    except Exception as _sil_e:
+        logger.warning(f"  [Silence] Pass skipped ({_sil_e}).")
 
     # Dialogue density guard — tighten any panel whose text would overflow its
     # slot (and otherwise be silently truncated at render time), so every
