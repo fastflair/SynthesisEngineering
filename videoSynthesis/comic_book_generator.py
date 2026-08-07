@@ -3179,6 +3179,49 @@ _FEW_SHOT_EXAMPLES = [
         "dominate the structural elements with vibrant electric blue "
         "accents."
     ),
+    # ── Example 6: MULTI-CHARACTER GROUP SHOT + LAYERED SHORELINE ENV ───────
+    # Layers: subject ✓✓ | clothing ✓✓ | pose ✓ | environment ✓✓ | objects ✓ | lighting ✓ | style ✓
+    (
+        "Animated 3D still life of three companions relaxing together near the ocean\n"
+        "Subject: A smiling young woman in casual clothes seated between her two "
+        "travelling companions, all three at ease with one another\n"
+        "Clothing: She wears an oversized hoodie with matching shorts and sneakers; "
+        "one companion wears a patterned wrap top and a woven fringed skirt with a "
+        "shell necklace; the other stands just behind holding a large carved "
+        "hook-shaped tool\n"
+        "Pose & Placement: All three seated or standing close together on a mossy "
+        "rock, bodies angled inward toward the group, smiling at one another\n"
+        "Environment: Foreground — grass scattered with colourful flowers and the "
+        "mossy rock they're seated on. Midground — the group clustered together, a "
+        "small animal at their feet. Background — a vibrant tropical shoreline under "
+        "bright daylight: turquoise ocean water, distant palm trees, pale sand "
+        "stretching to the horizon\n"
+        "Objects: A large intricately carved hook-shaped tool rests over one "
+        "companion's shoulder; a small animal sits at their feet\n"
+        "Lighting: Bright natural sunlight from above and slightly in front, "
+        "casting soft shadows on the grass and warm highlights across every face\n"
+        "Style Details: Polished 3D animation style, smooth textures, expressive "
+        "faces, richly saturated colours, detailed environmental foreground "
+        "elements reminiscent of feature animation."
+    ),
+    # ── Example 7: PURE-ENVIRONMENT ESTABLISHING SHOT, NO HUMAN FIGURE ──────
+    # Layers: environment ✓✓ | lighting ✓✓ | style ✓✓ (deliberately subject-optional)
+    (
+        "3D render of a majestic dragon-like presence emerging from stormy clouds\n"
+        "Subject: A powerful eastern-style dragon head with layered coral-red "
+        "horns, a voluminous white mane like flowing silk, and a single amber eye "
+        "reflecting the sky\n"
+        "Environment: Foreground — swirling mist at the base of the frame. "
+        "Midground — the dragon's mane and horns catching the light. Background — "
+        "deep grey cumulus storm clouds contrasting soft illuminated cloud layers, "
+        "small stylized birds flying near the snout for scale\n"
+        "Lighting: Soft directional light from the upper left casting gentle "
+        "shadows across the scales, warm red tones on the face against cooler "
+        "whites along the neck\n"
+        "Style Details: Intricate traditional dragon-art detailing blended with "
+        "modern digital rendering, vibrant reds paired with clean whites, dramatic "
+        "mythic scale, no human figures anywhere in frame."
+    ),
 ]
 
 # Lighting vocabulary extracted from the examples — used to detect if the

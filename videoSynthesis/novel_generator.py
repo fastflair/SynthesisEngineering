@@ -1821,26 +1821,101 @@ def get_openai_prompt_response_reasoning(prompt, max_completion_tokens=150000,
 # STORY & CHARACTER GENERATION
 # =============================================================================
 
+# This is the FIRST creative decision in the entire pipeline: every downstream
+# stage (casting, script, panel/shot descriptions, image prompts) inherits its
+# sense of "what world is this" from story_idea.premise. A thin premise here
+# starves every image prompt downstream of anything to draw an imaginative
+# background FROM — no matter how good the later prompt-engineering is, it
+# can't invent a rich, specific world out of a generic one-line premise. So
+# this function is deliberately over-built relative to its output size: it
+# asks for a genuinely distinctive hook, concrete stakes, and — critically —
+# a short list of recurring VISUAL MOTIFS (specific places, objects, colours,
+# textures unique to this story) that later panel/shot builders can reach for
+# instead of falling back to a bare, plain setting.
+_STORY_IDEA_PREFIX = (
+    "You are a bestselling novelist and film story consultant. Your job is to "
+    "take a raw, possibly rough or under-specified idea and develop it into a "
+    "genuinely compelling concept — not a generic summary of it.\n\n"
+    "A strong concept has:\n"
+    "  1. A HOOK: something specific and surprising about this premise that a "
+    "logline could sell in one sentence — avoid generic phrasing like 'a team "
+    "struggles to adapt to new technology'; find the sharp, ironic, or "
+    "vivid version of the same idea.\n"
+    "  2. CONCRETE STAKES: what is actually won or lost, and for whom, "
+    "specifically — not an abstract theme.\n"
+    "  3. A DISTINCTIVE VISUAL WORLD: 4-6 recurring visual motifs — specific "
+    "places, objects, colours, textures, or lighting conditions that are "
+    "UNIQUE to this story (not generic genre wallpaper). These get reused "
+    "throughout so the story has a consistent, imaginative look instead of "
+    "plain, interchangeable backdrops. Be concrete: not 'an office' but "
+    "'a rig control room lit entirely by monitor glow, its walls a lattice "
+    "of exposed conduit sweating condensation.'\n"
+    "  4. Avoid cliché defaults (generic 'gritty' or 'epic' descriptors with "
+    "nothing under them) — every element should feel like it belongs to THIS "
+    "story specifically, not to the genre in general.\n\n"
+    "Return ONLY a JSON object with this exact shape:\n"
+    '{"genre": "...", "themes": ["...", "..."], "mood": "...", '
+    '"hook": "one vivid sentence a reader has not heard before", '
+    '"premise": "2-4 sentences: setup, hook, and central stakes, richly specific", '
+    '"visual_motifs": ["specific recurring visual element 1", "...", '
+    '"... (4-6 total)"]}\n'
+    "JSON only, no prose outside the object."
+)
+
+
 def generate_story_idea(story_idea_str: str) -> StoryIdea:
-    """Develop a raw concept into a structured StoryIdea."""
-    prompt = (
-        f"You are a bestselling novelist's story consultant. Develop a compelling concept.\n\n"
-        f"Raw idea: '{story_idea_str}'\n\n"
-        f"Return as JSON: {{\"genre\": \"...\", \"themes\": [\"...\"], "
-        f"\"mood\": \"...\", \"premise\": \"...\"}}\n"
-        f"JSON only."
+    """Develop a raw concept into a structured StoryIdea.
+
+    Beyond genre/themes/mood/premise, this also asks for a `hook` (the sharp,
+    specific one-line take on the idea) and `visual_motifs` (4-6 concrete,
+    story-specific visual elements). Both are folded into `premise` so every
+    downstream consumer that only reads `.premise` immediately benefits, and
+    both are ALSO attached as `story_idea.hook` / `story_idea.visual_motifs`
+    for any caller that wants them directly (e.g. to seed richer panel/shot
+    environments instead of a bare setting string).
+    """
+    variable_block = f"Raw idea: '{story_idea_str}'\n\nDevelop this concept now."
+    response = get_openai_prompt_response(
+        variable_block, temperature=0.7, use_grok=USE_GROK,
+        cached_prefix=_STORY_IDEA_PREFIX,
     )
-    response = get_openai_prompt_response(prompt, temperature=0.5, use_grok=USE_GROK)
     story_data = parse_json_response(response)
     if isinstance(story_data, list) and len(story_data) > 0:
         story_data = story_data[0]
+
     if story_data and isinstance(story_data, dict):
-        return StoryIdea(
-            genre=story_data.get('genre', 'Any'),
-            themes=story_data.get('themes', ['Any']),
-            mood=story_data.get('mood', 'Any'),
-            premise=story_data.get('premise', 'Any')
-        )
+        genre = story_data.get('genre', 'Any')
+        themes = story_data.get('themes', ['Any'])
+        mood = story_data.get('mood', 'Any')
+        hook = str(story_data.get('hook', '') or '').strip()
+        premise = str(story_data.get('premise', 'Any') or 'Any').strip()
+        motifs = story_data.get('visual_motifs') or []
+        if not isinstance(motifs, list):
+            motifs = [str(motifs)] if motifs else []
+        motifs = [str(m).strip() for m in motifs if str(m or '').strip()][:6]
+
+        # Fold the hook + visual motifs into the premise text itself so every
+        # existing downstream consumer (casting, script, panel/shot builders)
+        # that reads only `.premise` — most of the pipeline — gets the richer
+        # material automatically, with zero call-site changes required.
+        full_premise = premise
+        if hook and hook.lower() not in premise.lower():
+            full_premise = f"{hook} {premise}".strip()
+        if motifs:
+            full_premise = (
+                full_premise.rstrip('.') + ". Recurring visual world: "
+                + "; ".join(motifs) + "."
+            )
+
+        idea = StoryIdea(genre=genre, themes=themes, mood=mood, premise=full_premise)
+        # Extra attributes for callers that want the structured pieces
+        # directly (safe: StoryIdea has no fixed __slots__, so this never
+        # breaks existing callers that only use genre/themes/mood/premise).
+        idea.hook = hook
+        idea.visual_motifs = motifs
+        idea.raw_premise = premise
+        return idea
+
     return StoryIdea(genre='Any', themes=['Any'], mood='Any', premise='Any')
 
 
