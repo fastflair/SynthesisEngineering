@@ -2709,21 +2709,10 @@ class AppearanceContinuityTracker:
         }
         self.states: Dict[str, CharacterAppearanceState] = {}
         # Setting string of the scene we're currently in. Used to reset transient
-        # state (notably nudity) when the story moves to a new scene/location —
-        # a character nude on a couch should not stay nude after a hard cut to a
-        # different place/time unless that new scene also depicts nudity.
+        # conditions on a hard cut (wetness, dust, sweat, tears; nudity only if
+        # the NEW panel does not itself still depict it). No public-setting
+        # clothing force — adult/NSFW continuity is allowed in any location.
         self._current_setting: str = ""
-        # Exposure tier of the current scene (public / private / intimate / …),
-        # classified from the setting. Used to guard against acquiring undress in
-        # a public place where it would be implausible. Recomputed on each scene
-        # change alongside _current_setting.
-        self._current_exposure: str = _EXPOSURE_UNKNOWN
-        # Per-character setting-appropriate clothing for the current scene. When
-        # a scene resolves a different appropriate baseline than the registry
-        # default (e.g. street clothes for a public scene when the registry
-        # baseline is intimate), that scene baseline is the reset target so
-        # transient-condition resets land on setting-appropriate attire.
-        self._scene_wardrobe: Dict[str, str] = {}
         # Rolling buffer of the last few (panel_id, description) pairs from the
         # PRECEDING batch, so the change-detector can see the story events that
         # produced the current incoming state. Without this, the regression
@@ -2790,130 +2779,6 @@ class AppearanceContinuityTracker:
             st.permanent_markings = sig
         self.states[name] = st
         return st
-
-    def _resolve_scene_wardrobe(self, panel: Dict, page_num: int,
-                                exposure: str) -> None:
-        """Resolve setting-appropriate clothing for every character in a scene.
-
-        Called on each scene change. Populates ``self._scene_wardrobe`` with
-        ``{name: clothing}`` for the characters in this scene, where the clothing
-        is what each character would plausibly be wearing given the scene's
-        location and exposure tier.
-
-        Resolution strategy (cheap → rich):
-          1. If the registry baseline is already setting-appropriate (not an
-             exposed/intimate descriptor, or the scene is private/intimate where
-             anything goes), use it unchanged — no work, no LLM call.
-          2. Otherwise (a public/semi-public scene whose characters carry an
-             exposed or intimate baseline), derive a neutral, setting-appropriate
-             outfit. Prefer an LLM call that dresses each character for the scene
-             while preserving their identity/style; fall back to a deterministic
-             neutral outfit so this never blocks synthesis.
-
-        The resolved wardrobe is the *reset target* for transient-condition
-        resets and the public-scene re-clothe guard — it does NOT overwrite the
-        character's current clothing mid-scene (continuity still owns that).
-        """
-        self._scene_wardrobe = {}
-        names = [n for n in _chars_in_frame(panel) if self._is_corporeal(n)]
-        if not names:
-            return
-
-        setting = (panel.get('setting') or '').strip()
-
-        # In private/intimate scenes, the registry/intimate baseline is fine —
-        # nothing to resolve.
-        if _exposure_allows_undress(exposure):
-            for name in names:
-                st = self.states.get(name)
-                if st:
-                    self._scene_wardrobe[name] = st.clothing or st.base_clothing
-            return
-
-        # Public / semi-public / unknown scene: ensure each character has a
-        # setting-appropriate baseline. Only the characters whose baseline is
-        # exposed/intimate need active re-dressing; the rest keep their baseline.
-        need_redress: List[str] = []
-        for name in names:
-            st = self.states.get(name)
-            if not st:
-                continue
-            baseline = st.base_clothing or ''
-            if _clothing_is_exposed(baseline) or not baseline:
-                need_redress.append(name)
-            else:
-                self._scene_wardrobe[name] = baseline
-
-        if not need_redress:
-            return
-
-        # Try an LLM pass to dress the flagged characters for the scene. This
-        # keeps each character's personal style while making the outfit
-        # plausible for the location. Falls back to a neutral outfit on failure.
-        resolved = self._llm_scene_wardrobe(need_redress, setting, exposure)
-        for name in need_redress:
-            outfit = (resolved.get(name) or '').strip()
-            if not outfit:
-                # Deterministic, identity-neutral fallback.
-                outfit = "ordinary setting-appropriate street clothes, fully covered"
-            self._scene_wardrobe[name] = outfit
-            logger.info(
-                f"[Wardrobe] p{page_num}: {name} dressed for "
-                f"'{setting[:40]}' ({exposure}) → {outfit[:50]}"
-            )
-
-    def _llm_scene_wardrobe(self, names: List[str], setting: str,
-                            exposure: str) -> Dict[str, str]:
-        """Ask the LLM for setting-appropriate outfits for the named characters.
-
-        Returns ``{name: outfit}``. On any failure returns {} so the caller uses
-        its deterministic fallback. Identity is preserved by passing each
-        character's locked portrait so the LLM dresses THEM, not a generic body.
-        """
-        try:
-            char_lines = []
-            for name in names:
-                portrait = ''
-                if self.registry is not None:
-                    if hasattr(self.registry, 'get_portrait'):
-                        portrait = self.registry.get_portrait(name) or ''
-                    if not portrait and hasattr(self.registry, 'get_appearance'):
-                        portrait = self.registry.get_appearance(name) or ''
-                char_lines.append(f"  {name}: {portrait[:200]}")
-            char_block = "\n".join(char_lines) if char_lines else "  (none)"
-
-            prompt = (
-                "You are a graphic-novel costume designer. Dress each character "
-                "in clothing that is PLAUSIBLE and APPROPRIATE for the scene's "
-                "location, while keeping their personal style and identity. "
-                "People wear setting-appropriate clothing in public — a "
-                "character who is undressed in a private scene is fully clothed "
-                "in a store, on the street, at work, or anywhere public.\n\n"
-                f"SCENE LOCATION: {setting or '(unspecified public place)'}\n"
-                f"EXPOSURE CONTEXT: {exposure} (public/semi-public — fully "
-                "clothed, ordinary attire for this place)\n\n"
-                "CHARACTERS (identity — keep their look, just dress them):\n"
-                f"{char_block}\n\n"
-                "For EACH character, write a complete, fully-covered outfit "
-                "appropriate to the location (garments + colours + materials, "
-                "20-40 words). No nudity, no lingerie, no intimate/undressed "
-                "states — this is a public scene.\n\n"
-                "Return ONLY a JSON object mapping each name to its outfit:\n"
-                '{ "Name": "outfit description", ... }'
-            )
-            raw = _llm(prompt, temperature=0.2)
-            parsed = _parse(raw)
-            if isinstance(parsed, dict):
-                out = {}
-                for k, v in parsed.items():
-                    if isinstance(v, str) and v.strip():
-                        # Resolve the LLM's key back to a known frame name.
-                        match = _match_state_name(k, {n: None for n in names}) or k
-                        out[match] = v.strip()
-                return out
-        except Exception as e:
-            logger.warning(f"[Wardrobe] LLM dressing failed ({e}); using fallback.")
-        return {}
 
     def _is_corporeal(self, name: str) -> bool:
         """True unless `name` is a known non-corporeal entity (a watching
@@ -3129,9 +2994,10 @@ class AppearanceContinuityTracker:
                                    for kw in list(cond.resolve[:4]) + [cond.name]):
                                 if st.remove_condition(cond.name):
                                     if cond.category == 'dress':
+                                        # Re-dress only when the story resolves
+                                        # nudity; use registry baseline only.
                                         st.clothing = (
-                                            self._scene_wardrobe.get(cname)
-                                            or st.base_clothing or 'fully clothed'
+                                            st.base_clothing or 'fully clothed'
                                         )
                                     applied += 1
                                     recorded_changes.append({
@@ -3150,29 +3016,6 @@ class AppearanceContinuityTracker:
                             if cond.text_indicates_active(_cond_text):
                                 _matched_cond = cond
                                 break
-                        if _matched_cond:
-                            if not _exposure_allows_undress(self._current_exposure) \
-                                    and _matched_cond.category == 'dress' \
-                                    and not _public_undress_is_explicit(
-                                        panel.get('description', '')):
-                                logger.info(
-                                    f"[Continuity] {pid}: suppressed "
-                                    f"'{_matched_cond.name}' for {cname} "
-                                    f"(public setting guard)."
-                                )
-                            elif st.add_condition(_matched_cond.name):
-                                if _matched_cond.category == 'dress':
-                                    st.clothing = 'fully nude, no clothing'
-                                applied += 1
-                                recorded_changes.append({
-                                    'character': cname, 'attribute': 'condition',
-                                    'transition': transition or f'acquiring {_matched_cond.name}',
-                                    'new_value': _matched_cond.descriptor,
-                                })
-                                logger.info(
-                                    f"[Continuity] {pid}: {cname} → "
-                                    f"{_matched_cond.name} (LLM-detected)."
-                                )
                         else:
                             # Store as free-text condition note for nuance
                             if st.apply_change('condition', newval):
@@ -3210,54 +3053,26 @@ class AppearanceContinuityTracker:
             desc = panel.get('description') or ''
             acquired_now, resolved_now = _scan_conditions(desc)
 
-            # Classify exposure for THIS panel's setting. Done every panel (not
-            # only on scene change) so the public-undress guard below always has
-            # the correct tier even within a scene the change-detector merged.
-            _panel_exposure = classify_setting_exposure(panel_setting, desc)
-
             if scene_changed:
-                # Recompute the scene exposure and resolve setting-appropriate
-                # clothing for everyone entering the new scene. The resolved
-                # wardrobe becomes the reset target so a transient state (nudity,
-                # wetness) clears to scene-appropriate attire, not a possibly
-                # inappropriate global baseline.
-                self._current_exposure = _panel_exposure
-                self._resolve_scene_wardrobe(panel, page_num, _panel_exposure)
                 for name in _chars_in_frame(panel):
                     st = self.states.get(name)
                     if not st:
                         continue
-                    # Scene-appropriate reset target for this character: prefer
-                    # the resolved scene wardrobe, then the registry baseline.
-                    _scene_clothes = (
-                        self._scene_wardrobe.get(name)
-                        or st.base_clothing or 'fully clothed'
-                    )
+                    # Registry baseline is the only re-dress target. Never invent
+                    # a "public-appropriate" wardrobe — adult/NSFW continuity is
+                    # allowed in any setting.
+                    _reset_clothes = st.base_clothing or 'fully clothed'
                     for cond_name in list(st.conditions):
                         cond = _CONDITIONS_BY_NAME.get(cond_name)
                         if (cond and cond.resets_on_scene_change
                                 and cond_name not in acquired_now):
                             st.remove_condition(cond_name)
                             if cond.category == 'dress':
-                                st.clothing = _scene_clothes
+                                st.clothing = _reset_clothes
                             logger.info(
                                 f"[Continuity] {pid}: scene change → {name} "
                                 f"'{cond_name}' cleared."
                             )
-                    # Even when no transient condition is active, a public-scene
-                    # entry should re-clothe a character whose current clothing
-                    # is an intimate/undress descriptor carried over from a soft
-                    # cut the reset above didn't catch. This is the belt-and-
-                    # suspenders fix for the "nude in the grocery store" case.
-                    if (not _exposure_allows_undress(self._current_exposure)
-                            and _clothing_is_exposed(st.clothing)
-                            and not _public_undress_is_explicit(desc)):
-                        st.clothing = _scene_clothes
-                        st.remove_condition('nude')
-                        logger.info(
-                            f"[Continuity] {pid}: public scene → {name} "
-                            f"re-clothed to scene-appropriate attire."
-                        )
                     # General facet scene-reset: any evolving facet whose table
                     # entry sets resets_on_scene_change=True is cleared on a hard
                     # cut UNLESS this new panel re-establishes it. By default no
@@ -3279,12 +3094,6 @@ class AppearanceContinuityTracker:
                 self._current_setting = panel_setting
             elif panel_setting and not self._current_setting:
                 self._current_setting = panel_setting
-                self._current_exposure = _panel_exposure
-                self._resolve_scene_wardrobe(panel, page_num, _panel_exposure)
-            elif not self._current_setting:
-                # No setting yet established and none on this panel: still derive
-                # exposure from the description so the guard can act.
-                self._current_exposure = _panel_exposure
 
             # ── Condition safety net (LLM-failure failsafe only) ─────────────
             # _scan_conditions is kept ONLY as a backstop for the case where
@@ -3295,6 +3104,10 @@ class AppearanceContinuityTracker:
             # top of a successful LLM pass would double-apply conditions and
             # produce spurious acquisitions on prose that the LLM correctly
             # judged as not depicting a condition change.
+            #
+            # Adult/NSFW content is fully allowed in any setting (public or
+            # private). There is NO public-exposure / allowable-undress guard —
+            # if the description depicts undress or nudity, it is tracked.
             _llm_ran = bool(detections)  # True when the LLM returned ANY result
             if not _llm_ran:
                 # LLM batch completely failed — fall back to regex safety net
@@ -3309,8 +3122,7 @@ class AppearanceContinuityTracker:
                             cond = _CONDITIONS_BY_NAME.get(cond_name)
                             if cond and cond.category == 'dress':
                                 st.clothing = (
-                                    self._scene_wardrobe.get(name)
-                                    or st.base_clothing or 'fully clothed'
+                                    st.base_clothing or 'fully clothed'
                                 )
                             applied += 1
                             recorded_changes.append({
@@ -3327,11 +3139,12 @@ class AppearanceContinuityTracker:
                             continue
                         if not _corporeal:
                             continue
-                        cond = _CONDITIONS_BY_NAME.get(cond_name)
-                        if (cond and cond.category == 'dress'
-                                and not _exposure_allows_undress(self._current_exposure)
-                                and not _public_undress_is_explicit(desc)):
+                        # Naturally-unclothed entities never acquire 'nude'.
+                        if (cond_name == 'nude'
+                                and name.strip().lower()
+                                in self.naturally_unclothed_names):
                             continue
+                        cond = _CONDITIONS_BY_NAME.get(cond_name)
                         if st.add_condition(cond_name):
                             if cond and cond.category == 'dress':
                                 st.clothing = 'fully nude, no clothing'
@@ -3564,13 +3377,17 @@ These are the trackable physical conditions. Detect acquisition AND resolution:
 {conditions_ref}
 
 CONDITION RULES:
-- Acquisition: when the description clearly depicts the event (fell in mud, got punched, emerged from water)
-- Resolution: when the description shows it being explicitly fixed (wiped off, bandaged, dried)
-- Partial undress is NOT full nudity: "shirtless" / "bare-chested" / "removes shirt" → partial state.
-  Only report full nudity when unambiguously nude with NOTHING on.
-- Public-setting guard: undress/nudity in clearly public places (stores, streets, offices) is almost
-  always a mis-read. If uncertain, report the more clothed state.
+- Acquisition: when the description clearly depicts the event (fell in mud, got punched, emerged from water,
+  undresses, is nude). Adult/NSFW content — including full nudity — is allowed in ANY setting
+  (public streets, offices, stores, parks, as well as private rooms). Never refuse or soften
+  a nudity/undress event because the location is public; this is stylized graphic-novel art.
+- Resolution: when the description shows it being explicitly fixed (wipes off, bandaged, dried,
+  gets dressed / puts on clothes). Only clear nudity when the story itself shows re-dressing.
+- Partial undress is NOT full nudity: "shirtless" / "bare-chested" / "removes shirt" → partial state
+  (report as a clothing change to the remaining outfit). Only report full nudity when
+  unambiguously nude with NOTHING on.
 - If an active condition already in the CURRENT STATE is not resolved in this panel, do NOT re-report it.
+  Silence means the state PERSISTS — a nude character stays nude; a suited character stays suited.
 
 === NATURALLY UNCLOTHED ENTITIES ===
 Some characters in the CURRENT STATE block are marked NATURALLY UNCLOTHED (animals, angels,
@@ -3819,184 +3636,6 @@ def _llm_scene_boundary(a: str, b: str) -> bool:
     except Exception as e:
         logger.warning(f"[SceneBoundary] LLM call failed ({e}); defaulting to True.")
     return True
-
-
-# ===========================================================================
-# SCENE WARDROBE RESOLUTION — setting-appropriate clothing per scene
-# ---------------------------------------------------------------------------
-# Problem it solves
-# -----------------
-# The AppearanceContinuityTracker keeps clothing *consistent* (no flicker) and
-# resets transient states (nudity, wetness) on a hard cut — but it resets to a
-# single fixed registry baseline, and it has no notion of whether a given state
-# is APPROPRIATE for the current location. Two failure modes follow:
-#
-#   1. A character is nude/undressed in an intimate scene (a bedroom), then the
-#      story hard-cuts to a PUBLIC place (a grocery store, a street, an office).
-#      If the scene-change reset misfires (settings share vocabulary, or the
-#      cut is "soft"), the nudity persists into the public scene — a character
-#      drawn nude in a grocery store.
-#   2. The registry baseline outfit itself may be scene-inappropriate. In a
-#      "steamy drama" a character's baseline might be lingerie or a robe; when
-#      nudity resets, it falls back to THAT baseline even in a public setting.
-#
-# The general principle the user articulated: a character's depicted clothing
-# must be a function of the SCENE (its location + social context), not just a
-# fixed baseline plus continuity. A character intimate at home is clothed at
-# the store. This is true across every genre — it is about plausibility, not
-# censorship: people wear setting-appropriate clothing in public.
-#
-# The fix: a per-scene wardrobe resolver. On each scene change it (a) classifies
-# the setting's exposure context (public / semi-public / private / intimate),
-# and (b) computes a setting-appropriate clothing baseline for each character in
-# the scene. That scene baseline becomes the reset target, and a guard prevents
-# undress/nudity from being acquired in a clearly PUBLIC setting unless the
-# description gives strong, explicit, plausible justification (a locker room, a
-# medical exam, a nude beach — places where it is contextually normal).
-#
-# Design: deterministic keyword classification first (fast, no tokens), with an
-# optional LLM enrichment per UNIQUE setting (cached) for ambiguous cases. If
-# the LLM is unavailable the keyword classifier alone is safe and useful.
-# ===========================================================================
-
-# Exposure tiers, ordered from most to least public. A character's undress is
-# only plausible without explicit justification at 'private'/'intimate'.
-_EXPOSURE_PUBLIC      = 'public'        # store, street, office, school, restaurant
-_EXPOSURE_SEMIPUBLIC  = 'semi_public'   # lobby, hallway, party, gym floor, bar
-_EXPOSURE_PRIVATE     = 'private'       # home, apartment, hotel room, car
-_EXPOSURE_INTIMATE    = 'intimate'      # bedroom, bathroom, bath, shower, bed
-_EXPOSURE_UNKNOWN     = 'unknown'
-
-# Settings where undress/nudity IS contextually normal even though they are not
-# someone's private home — explicit, plausible exceptions to the public guard.
-_EXPOSURE_NUDE_OK_CUES = (
-    'locker room', 'changing room', 'change room', 'dressing room', 'fitting room',
-    'shower', 'showers', 'bath', 'bathhouse', 'bathroom', 'sauna', 'steam room',
-    'spa', 'hot spring', 'onsen', 'nude beach', 'naturist', 'skinny dip',
-    'examination room', 'exam room', 'operating room', 'morgue', 'autopsy',
-    'life drawing', 'art studio', 'massage', 'pool', 'swimming',
-)
-
-# Keyword cues for each exposure tier. First match (most public wins on ties via
-# ordering of the checks below) determines the tier.
-_EXPOSURE_PUBLIC_CUES = (
-    'grocery', 'supermarket', 'market', 'store', 'shop', 'mall', 'street',
-    'sidewalk', 'road', 'avenue', 'plaza', 'square', 'park', 'office',
-    'workplace', 'school', 'classroom', 'university', 'campus', 'library',
-    'restaurant', 'cafe', 'café', 'diner', 'courtroom', 'court', 'hospital',
-    'clinic', 'station', 'airport', 'train', 'bus', 'subway', 'platform',
-    'church', 'temple', 'mosque', 'museum', 'gallery', 'stadium', 'arena',
-    'parking lot', 'crosswalk', 'bank', 'pharmacy', 'checkout', 'aisle',
-    'marketplace', 'bazaar', 'festival', 'parade', 'public',
-)
-_EXPOSURE_SEMIPUBLIC_CUES = (
-    'lobby', 'hallway', 'corridor', 'elevator', 'stairwell', 'foyer',
-    'reception', 'waiting room', 'bar', 'pub', 'club', 'lounge', 'party',
-    'gym', 'rooftop', 'balcony', 'porch', 'garden', 'backyard', 'courtyard',
-    'hotel lobby', 'office kitchen', 'break room',
-)
-_EXPOSURE_PRIVATE_CUES = (
-    'apartment', 'flat', 'house', 'home', 'living room', 'kitchen', 'study',
-    'den', 'office at home', 'hotel room', 'motel', 'cabin', 'car', 'vehicle',
-    'studio apartment', 'loft', 'basement', 'attic', 'garage', 'trailer',
-    "someone's home", 'her place', 'his place', 'their place',
-)
-_EXPOSURE_INTIMATE_CUES = (
-    'bedroom', 'bed', 'master suite', 'boudoir', 'bathtub',
-    'en suite', 'ensuite', 'hotel suite', 'honeymoon',
-)
-
-
-def classify_setting_exposure(setting: str, description: str = "") -> str:
-    """Classify a scene's exposure context from its setting (+ description).
-
-    Returns one of _EXPOSURE_PUBLIC / _SEMIPUBLIC / _PRIVATE / _INTIMATE /
-    _UNKNOWN. Deterministic keyword match — fast and token-free. The intimate
-    and nude-OK cues are checked first (most specific), then private, then the
-    public/semi-public cues; this ordering means a "hotel room bathroom" reads
-    as intimate, not public, while a "grocery store" reads as public.
-
-    `description` is scanned in addition to `setting` so a scene whose setting
-    string is vague ("a large room") but whose description names a checkout
-    counter still classifies correctly.
-    """
-    blob = f"{setting or ''} {description or ''}".lower()
-    if not blob.strip():
-        return _EXPOSURE_UNKNOWN
-
-    def _has(cues) -> bool:
-        return any(cue in blob for cue in cues)
-
-    # Nude-OK contexts and intimate spaces are the most specific — check first.
-    if _has(_EXPOSURE_NUDE_OK_CUES):
-        # These are places undress is normal; treat as intimate for wardrobe
-        # purposes (undress allowed) even if technically semi-public.
-        return _EXPOSURE_INTIMATE
-    if _has(_EXPOSURE_INTIMATE_CUES):
-        return _EXPOSURE_INTIMATE
-    # Public cues win over private when both somehow appear (a "store" reference
-    # dominates), because the cost of mistakenly allowing undress in public is
-    # far higher than the reverse.
-    if _has(_EXPOSURE_PUBLIC_CUES):
-        return _EXPOSURE_PUBLIC
-    if _has(_EXPOSURE_SEMIPUBLIC_CUES):
-        return _EXPOSURE_SEMIPUBLIC
-    if _has(_EXPOSURE_PRIVATE_CUES):
-        return _EXPOSURE_PRIVATE
-    return _EXPOSURE_UNKNOWN
-
-
-def _exposure_allows_undress(exposure: str) -> bool:
-    """True if undress/nudity is contextually plausible in this exposure tier
-    WITHOUT explicit strong justification. Private and intimate spaces qualify;
-    public, semi-public, and unknown do not (unknown errs on the safe side)."""
-    return exposure in (_EXPOSURE_PRIVATE, _EXPOSURE_INTIMATE)
-
-
-# Strong, explicit undress cues that may override the public-setting guard when
-# the story genuinely depicts public undress as a deliberate beat (a streaker, a
-# public protest, a nightmare). These are intentionally narrow: a bare verb of
-# undressing in a public place is NOT enough; the description must make the
-# public exposure itself the explicit subject.
-_PUBLIC_UNDRESS_OVERRIDE_CUES = (
-    'streak', 'streaker', 'streaking', 'public nudity', 'naked in public',
-    'nude in public', 'strips in front of everyone', 'strips in front of the crowd',
-    'flashes the crowd', 'bares herself to the crowd', 'bares himself to the crowd',
-    'naked protest', 'nude protest',
-)
-
-
-def _public_undress_is_explicit(description: str) -> bool:
-    """True only when a public scene's description makes public undress its
-    explicit, deliberate subject — the narrow exception to the public guard."""
-    d = (description or '').lower()
-    return any(cue in d for cue in _PUBLIC_UNDRESS_OVERRIDE_CUES)
-
-
-# Clothing descriptors that denote an exposed / undressed / intimate state. Used
-# to detect when a character's CURRENT clothing string (carried across a soft
-# cut) is inappropriate for a public scene and must be replaced. Kept narrow and
-# explicit so ordinary attire ("a low-cut dress", "shorts") is never flagged —
-# only genuinely undressed/intimate states.
-_EXPOSED_CLOTHING_CUES = (
-    'nude', 'naked', 'no clothing', 'no clothes', 'unclothed', 'undressed',
-    'bare body', 'fully nude', 'completely nude', 'topless', 'bottomless',
-    'in nothing but', 'wearing nothing', 'just a towel', 'only a towel',
-    'just underwear', 'only underwear', 'in lingerie', 'lingerie only',
-    'in only a robe', 'open robe', 'just a bra', 'just panties',
-    'in only her underwear', 'in only his underwear',
-)
-
-
-def _clothing_is_exposed(clothing: str) -> bool:
-    """True if a clothing descriptor denotes an undressed / intimate state that
-    would be inappropriate in a public setting."""
-    c = (clothing or '').lower()
-    return any(cue in c for cue in _EXPOSED_CLOTHING_CUES)
-
-
-
-
 
 def _safe_int(v, default: int = 1) -> int:
     try:
