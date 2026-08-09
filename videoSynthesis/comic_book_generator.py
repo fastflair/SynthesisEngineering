@@ -739,7 +739,8 @@ def generate_character_backstory_beats(
     prompt = (
         f"{_SINGLE_IMAGE_RULE}\n\n"
         "You are a master graphic novelist deciding WHERE and HOW to weave "
-        "character backstory/flashback moments into the main story.\n\n"
+        "character backstory/flashback moments into the main story.\n"
+        "Adult and NSFW content should reference young adults, not children.\n\n"
         "The best graphic novels never dump backstory as exposition. Instead "
         "they EARN flashbacks by placing them at moments of maximum dramatic "
         "relevance:\n"
