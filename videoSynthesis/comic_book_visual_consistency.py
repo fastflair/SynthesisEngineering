@@ -143,9 +143,14 @@ class PanelConsistencyLedger:
     characters: List[CharacterExpectation] = field(default_factory=list)
     key_emotion: str = ""
     setting: str = ""
+    # Post-render anachronism check (NEW): a single scene-level expectation line
+    # for the story's era, e.g. "No post-medieval technology (no phones, screens,
+    # cars, electric light)." Empty for contemporary/unconstrained stories.
+    period_expectation: str = ""
 
     def is_checkable(self) -> bool:
-        return any(c.is_checkable() or c.has_emotion_check() for c in self.characters)
+        return bool(self.period_expectation) or any(
+            c.is_checkable() or c.has_emotion_check() for c in self.characters)
 
     def as_check_spec(self) -> str:
         """Render the ledger into the numbered spec the vision model scores."""
@@ -153,6 +158,9 @@ class PanelConsistencyLedger:
         for i, c in enumerate(self.characters):
             if c.is_checkable() or c.has_emotion_check():
                 lines.append(f"  C{i} — {c.describe()}.")
+        # Scene-level period expectation, checked like any other visual fact.
+        if self.period_expectation:
+            lines.append(f"  SCENE — {self.period_expectation}")
         return "\n".join(lines)
 
 
@@ -281,6 +289,16 @@ def build_consistency_ledger(
             exp.expected_emotion = chosen_emotion[:60]
 
         ledger.characters.append(exp)
+
+    # Period expectation (NEW) — a scene-level line derived from this panel's
+    # stamped _period_lock, so the vision checker can catch a rendered
+    # anachronism (a wall-clock in a medieval hall) the same way it catches a
+    # wrong garment colour. Empty for contemporary/unstamped panels.
+    try:
+        from comic_book_period_consistency import period_expectation_line
+        ledger.period_expectation = period_expectation_line(panel_script) or ""
+    except Exception:
+        ledger.period_expectation = ""
 
     return ledger
 

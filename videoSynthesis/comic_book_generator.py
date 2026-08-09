@@ -3979,6 +3979,19 @@ def _adaptive_negative_prompt(panel_script: Dict = None) -> str:
     _media_excl = style_negative_terms(panel_script)
     _msuffix = (", " + _media_excl) if _media_excl else ""
 
+    # Period exclusion (NEW) — the negative-prompt half of the time-period lock.
+    # A negated noun in a POSITIVE prompt activates the concept, so the only
+    # effective place to suppress "smartphone, laptop, digital screen, car,
+    # electric light…" for a period story is here. Reads the panel's _period_lock
+    # (stamped by annotate_script_with_period); '' for contemporary/unstamped
+    # panels, so the negative prompt is unchanged for stories that don't need it.
+    try:
+        from comic_book_period_consistency import period_negative_terms as _pnt
+        _period_excl = _pnt(panel_script=panel_script)
+    except Exception:
+        _period_excl = ""
+    _psuffix = (", " + _period_excl) if _period_excl else ""
+
     chars = panel_script.get('characters_in_frame') or []
     ptype = str(panel_script.get('panel_type', '') or '').lower()
 
@@ -3989,7 +4002,7 @@ def _adaptive_negative_prompt(panel_script: Dict = None) -> str:
             "human silhouette, figure in the distance, lone figure, "
             "crowd, group of people, human face, portrait, "
             "astronaut, pedestrian, bystander"
-        ) + _msuffix
+        ) + _msuffix + _psuffix
 
     if len(chars) <= 2:
         # Exactly the scripted cast — suppress extras and crowds.
@@ -3997,9 +4010,9 @@ def _adaptive_negative_prompt(panel_script: Dict = None) -> str:
             ", crowd, crowds, group of people, many people, "
             "extra people in background, third person, bystanders, "
             "background characters, audience, onlookers"
-        ) + _msuffix
+        ) + _msuffix + _psuffix
 
-    return base + _msuffix
+    return base + _msuffix + _psuffix
 
 
 # =============================================================================
@@ -17717,6 +17730,24 @@ def compose_panel_prompt(panel_script: Dict, story_idea: StoryIdea,
     appearance_clause = appearance_continuity_clause(panel_script, chars_in_frame)
     _use_tracker_costume = bool(appearance_clause)
 
+    # Period + location locks (NEW) — read the per-panel annotations stamped by
+    # the period and scene-graph passes. `period_clause` restates the era so the
+    # model doesn't drift anachronistic ("a period-appropriate hall, no modern
+    # objects"); `scene_clause` restates this panel's canonical location so it
+    # can't wander mid-scene. Both are '' for contemporary/unstamped panels, so
+    # nothing changes for stories that don't need them. Imported lazily so the
+    # generator still loads if the modules aren't present.
+    try:
+        from comic_book_period_consistency import period_guard_clause as _pgc
+        period_clause = _pgc(panel_script)
+    except Exception:
+        period_clause = ''
+    try:
+        from comic_book_scene_graph import scene_continuity_clause as _scc
+        scene_clause = _scc(panel_script)
+    except Exception:
+        scene_clause = ''
+
     # World-State Continuity clauses (from track_world_continuity annotations):
     #   age_clause   → Subject section: a strong apparent-age descriptor per
     #                  character so the model can't drift young/old and a
@@ -18253,6 +18284,14 @@ def compose_panel_prompt(panel_script: Dict, story_idea: StoryIdea,
     _style_guard = style_guard_clause(panel_script)
     if _style_guard and not is_cosmic:
         _style_bits.append(_style_guard)
+    # Location lock (NEW) — keep the panel in this scene's canonical place.
+    if scene_clause and not is_cosmic:
+        _style_bits.append(scene_clause)
+    # Period lock (NEW) — applied even to cosmic/surreal panels, because a
+    # medieval vision still shouldn't contain a laptop. Placed last so it reads
+    # as an overarching rule over the whole frame.
+    if period_clause:
+        _style_bits.append(period_clause)
     # Master technique atmosphere and detail cues — these are technique-specific
     # rendering instructions (palette state, ink-line emphasis, unique material
     # details) that sit in Style Details because they are global to the panel's
@@ -18328,6 +18367,15 @@ def compose_panel_prompt(panel_script: Dict, story_idea: StoryIdea,
     # the manifest under 'prompt' AND passes to the image model — they are never
     # allowed to diverge, so the manifest prompt is always an accurate, complete,
     # standalone description of how the image was generated.
+    # Period scrub (NEW) — belt-and-suspenders: even with the positive lock and
+    # the negative prompt, an upstream LLM can write a literal anachronism into
+    # the description ("she checks her phone"). Rewrite any such noun to a
+    # period-appropriate equivalent. No-op for contemporary/unstamped panels.
+    try:
+        from comic_book_period_consistency import scrub_anachronisms as _scrub
+        assembled = _scrub(assembled, panel_script)
+    except Exception:
+        pass
     return assembled
 
 # =============================================================================
@@ -31317,6 +31365,25 @@ def enhance_existing_comic(working_dir: str, output_dir: str,
             resolve_ambiguous_character_names(
                 script, project.character_registry, project.characters,
             )
+            # Refresh location + period annotations too (NEW): descriptions and
+            # settings may have shifted during motif enhancement, so re-cluster
+            # scenes and re-stamp the era. Period establishment is cached, so
+            # this is effectively free. Both degrade to a no-op if unavailable.
+            try:
+                from comic_book_scene_graph import enforce_scene_continuity
+                from comic_book_art_director import _settings_differ as _sg_sd
+                enforce_scene_continuity(script, settings_differ=_sg_sd)
+            except Exception:
+                pass
+            try:
+                from comic_book_period_consistency import (
+                    establish_period_profile, annotate_script_with_period,
+                )
+                annotate_script_with_period(
+                    script, establish_period_profile(
+                        getattr(project, 'story_idea', None)))
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"  [Enhance] Motif pass skipped ({e}).")
 
@@ -31882,6 +31949,59 @@ def synthesize_comic_book(
                                   visual_bible=visual_bible)
         except Exception as _e:
             logger.warning(f"  [Motif] Enhancement skipped ({_e}).")
+
+        # Location-Continuity pass (NEW) — cluster the free-text settings into
+        # canonical locations and cut the panel stream into scenes, then relabel
+        # an unmotivated forest→room→forest flip-flop back to its scene's
+        # canonical location rather than rendering the oscillation. Reuses the
+        # SAME `_settings_differ` predicate the rest of the pipeline uses, so
+        # scene boundaries never disagree. Runs BEFORE appearance/world tracking
+        # so those passes read the corrected settings. Degrades to a no-op when
+        # the module or the LLM is unavailable.
+        try:
+            from comic_book_scene_graph import enforce_scene_continuity
+            try:
+                from comic_book_art_director import _settings_differ as _sg_sd
+            except Exception:
+                _sg_sd = None
+            _scene_report = enforce_scene_continuity(script_raw, settings_differ=_sg_sd)
+            _rel = _scene_report.get("relabelled") or []
+            _flg = _scene_report.get("flagged_for_transition") or []
+            if _rel:
+                logger.info(
+                    f"  [SceneGraph] relabelled {len(_rel)} oscillating panel(s) "
+                    f"to their scene's canonical location."
+                )
+            if _flg:
+                logger.info(
+                    f"  [SceneGraph] {len(_flg)} genuine location change(s) "
+                    f"flagged for a transition beat."
+                )
+        except Exception as _e:
+            logger.warning(f"  Scene-graph continuity skipped ({_e}).")
+
+        # Time-Period pass (NEW) — establish the story's era ONCE (one cached LLM
+        # call, with a keyword fallback) and stamp every panel with the era
+        # active there, handling flashbacks / time-jumps so it stays story-driven
+        # rather than a blanket rule. This makes the era available to the prompt
+        # builder (positive lock + negative terms + literal-anachronism scrub) so
+        # a Middle-Ages story never renders a laptop or a digital screen. No-op
+        # for contemporary/unconstrained stories.
+        try:
+            from comic_book_period_consistency import (
+                establish_period_profile, annotate_script_with_period,
+            )
+            _period_profile = establish_period_profile(story_idea)
+            annotate_script_with_period(script_raw, _period_profile)
+            if not _period_profile.is_empty():
+                logger.info(
+                    f"  [Period] era='{_period_profile.era_label}' "
+                    f"(tier={_period_profile.technology_tier}); "
+                    f"{len(_period_profile.forbidden_nouns)} anachronism term(s) "
+                    f"locked out of prompts."
+                )
+        except Exception as _e:
+            logger.warning(f"  Period consistency skipped ({_e}).")
 
         # Appearance Continuity pass — walk the script in narrative order and
         # track how each character's MUTABLE appearance (clothing, hair,

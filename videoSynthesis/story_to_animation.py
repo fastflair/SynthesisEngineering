@@ -4387,6 +4387,24 @@ def _finalize_image_prompt(shot: "Shot", prompt: str, theme: str) -> str:
                 lines[i] = f"{label}: {body}; {face_note}"
                 prompt = "\n".join(lines)
                 break
+    # Consistency locks (NEW) — append this shot's wardrobe / location / period
+    # locks (threaded on by animation_consistency_bridge.prepare_shots_for_
+    # animation), then scrub any literal anachronism. Because this finalizer runs
+    # again right before each still is rendered, the locks are re-applied LAST —
+    # so even if a later prompt-review/enrich pass rewrote the prompt and dropped
+    # them, they're restored before generation. Idempotent (the block is only
+    # appended when not already present) and a full no-op for shots the bridge
+    # didn't prepare or non-period films.
+    try:
+        from animation_consistency_bridge import (
+            shot_consistency_locks, scrub_shot_prompt,
+        )
+        _locks = shot_consistency_locks(shot)
+        if _locks and _locks not in prompt:
+            prompt = prompt.rstrip() + "\n" + _locks
+        prompt = scrub_shot_prompt(shot, prompt)
+    except Exception:
+        pass
     return prompt
 
 
@@ -7492,7 +7510,21 @@ class BaseVideo:
         stem = Path(out_path).stem
         seg_paths: List[str] = []
         base_seed = self._seed(shot)
-        start_img = Image.open(shot.image_path).convert("RGB")
+        # Cross-shot carry (NEW): if animate_shots stamped a carry frame — the
+        # last frame of the previous shot in the SAME continuous scene — begin
+        # the take from it so the location/props/lighting continue seamlessly
+        # instead of the keyframe redrawing the space. Falls back to the shot's
+        # own keyframe when no carry frame was set or the file is missing.
+        _carry = getattr(shot, "_carry_start_image", None)
+        if _carry and Path(_carry).exists():
+            try:
+                start_img = Image.open(_carry).convert("RGB")
+                logger.info("  shot %04d  starting take from carried last frame.",
+                            shot.index)
+            except Exception:
+                start_img = Image.open(shot.image_path).convert("RGB")
+        else:
+            start_img = Image.open(shot.image_path).convert("RGB")
         gi = 0                                              # global segment index
         cursor = 0.0                                         # actual elapsed seconds rendered
         carry = 0.0                                          # ideal-vs-actual delta, folded into the next ask
@@ -10175,6 +10207,18 @@ def animate_shots(shots: List[Shot], vcfg: VideoConfig, pcfg: ProjectConfig,
     """Render every shot, grouped by engine so each model loads/unloads once."""
     clips_dir = Path(pcfg.workdir()) / "clips"
 
+    # Narrative-order predecessor map (NEW) — used for the I2V cross-shot carry:
+    # when two consecutive shots are the same continuous scene, the later shot's
+    # keyframe can literally continue the previous shot's LAST FRAME instead of a
+    # freshly drawn still, so the location stops re-drawing itself every cut.
+    # Shots are rendered bucketed by engine, so the predecessor may or may not
+    # have a video yet at render time; the carry simply no-ops when it doesn't.
+    _prev_by_index: Dict[int, Shot] = {}
+    _ordered = sorted(shots, key=lambda s: s.index)
+    for _i, _s in enumerate(_ordered):
+        if _i > 0:
+            _prev_by_index[_s.index] = _ordered[_i - 1]
+
     # assign engines first (plan_engines_and_anchors usually did this already)
     for sh in shots:
         if not sh.image_path:
@@ -10290,6 +10334,27 @@ def animate_shots(shots: List[Shot], vcfg: VideoConfig, pcfg: ProjectConfig,
             prompt = _video_prompt(sh, pcfg.theme, vcfg)
             raw = str(clips_dir / f"shot{sh.index:04d}_{eng_name}_raw.mp4")
             final = str(clips_dir / f"shot{sh.index:04d}_{eng_name}.mp4")
+            # Cross-shot last-frame carry (NEW): if this shot continues the same
+            # scene as its predecessor and that predecessor already rendered,
+            # stash its last frame so the engine starts from it (see animate()).
+            # No-op across scene cuts, for first-in-scene shots, or when the
+            # predecessor hasn't rendered yet — in all those cases the shot's own
+            # keyframe is used exactly as before.
+            try:
+                from animation_consistency_bridge import carry_reference_for_shot
+                _prev = _prev_by_index.get(sh.index)
+                if _prev is not None:
+                    _ref = carry_reference_for_shot(
+                        _prev, sh,
+                        extract_last_frame=lambda vp: _extract_last_frame(
+                            vp, str(clips_dir / f"carry_{sh.index:04d}.png")),
+                    )
+                    if _ref and Path(_ref).exists():
+                        sh._carry_start_image = _ref
+                        logger.info("  shot %04d  I2V carry: continuing from the "
+                                    "previous shot's last frame.", sh.index)
+            except Exception as _e:
+                logger.debug("  shot %04d carry skipped (%s).", sh.index, _e)
             ok = False
             fatal = False
             last_exc: Optional[Exception] = None
@@ -11961,6 +12026,27 @@ class StoryAnimator:
         )
         self.shots = shots_from_comic_script(script)
         self._story_idea_str = story_idea
+        # Consistency bridge (NEW) — the animation path historically bypassed the
+        # comic's appearance tracker and scene anchors, so wardrobe evolution and
+        # scene/period consistency were lost here. Run them over the shot list now
+        # so each shot carries its evolved wardrobe, canonical location, and era
+        # lock. Safe no-op if the bridge module is unavailable.
+        try:
+            from animation_consistency_bridge import prepare_shots_for_animation
+            self._consistency_report = prepare_shots_for_animation(
+                self.shots,
+                characters,
+                story_idea=story_idea_obj,
+                registry=getattr(self, "registry", None),
+                visual_bible=visual_bible,
+                graph=graph,
+            )
+            _prof = (self._consistency_report or {}).get("period_profile")
+            if _prof is not None and not _prof.is_empty():
+                logger.info("[CONSISTENCY] era locked: %s (tier=%s)",
+                            _prof.era_label, _prof.technology_tier)
+        except Exception as _e:
+            logger.warning("[CONSISTENCY] shot preparation skipped (%s).", _e)
         logger.info("[STORY] %d shots from %d pages.", len(self.shots), len(script))
         return self
 
@@ -11982,6 +12068,22 @@ class StoryAnimator:
         self.characters = cast
         default_name = getattr(cast[0], "name", "Speaker") if cast else "Speaker"
         self.shots = shots_from_user_script(script, default_name)
+        # Consistency bridge (NEW) — user-written scripts never touch the comic
+        # generator, so this is the ONLY place their wardrobe/location/period
+        # consistency gets established. The bridge reconstructs a lightweight
+        # script from the shots and runs the scene-graph, period, and appearance
+        # passes over it. Safe no-op if the module is unavailable.
+        try:
+            from animation_consistency_bridge import prepare_shots_for_animation
+            self._consistency_report = prepare_shots_for_animation(
+                self.shots,
+                cast,
+                story_idea=getattr(self, "story_idea", None),
+                registry=getattr(self, "registry", None),
+                visual_bible=getattr(self, "visual_bible", None),
+            )
+        except Exception as _e:
+            logger.warning("[CONSISTENCY] shot preparation skipped (%s).", _e)
         logger.info("[SCRIPT] %d shots from provided script.", len(self.shots))
         # Optionally synthesize an EI graph so script-mode casts also get subtext.
         if project.build_ei_graph_for_script and _HAS_NG and cast:
